@@ -16,10 +16,16 @@ class ClientSession:
         self.status = "connected"
 
     def send(self, data: bytes):
+        if self.status != "connected":
+            return False
         try:
             self.conn.sendall(data)
             return True
+        except (OSError, BrokenPipeError, ConnectionResetError):
+            self.close()
+            return False
         except Exception:
+            self.close()
             return False
 
     def close(self):
@@ -46,7 +52,6 @@ class ClientListModel(QAbstractListModel):
         return QVariant()
 
     def add(self, sess: ClientSession):
-        # 修复：第一个参数必须是QModelIndex()，不能传QVariant()
         self.beginInsertRows(QModelIndex(), len(self.clients), len(self.clients))
         self.clients.append(sess)
         self.endInsertRows()
@@ -150,16 +155,40 @@ class MainWin(QMainWindow):
         act_cmd = menu.addAction("下发自定义指令")
         act_close = menu.addAction("断开连接")
         action = menu.exec(self.list_view.viewport().mapToGlobal(pos))
+
+        def _send_worker(s: ClientSession, payload: bytes, ok_msg: str, fail_msg: str):
+            try:
+                ret = s.send(payload)
+                if ret:
+                    self.log(ok_msg)
+                else:
+                    self.log(fail_msg)
+            except Exception as e:
+                self.log(f"发送异常: {repr(e)}")
+
         if action == act_ping:
-            sess.send(b"PING")
-            self.log(f"向 {sess.ip_str} 发送PING")
+            threading.Thread(
+                target=_send_worker,
+                args=(sess, b"PING", f"向 {sess.ip_str} 发送PING", f"向 {sess.ip_str} 发送PING失败，连接失效"),
+                daemon=True
+            ).start()
+
         elif action == act_cmd:
-            text, ok = QInputDialog.getText(self, "下发指令", "输入指令内容:")
-            if ok and text:
-                sess.send(text.encode("ascii"))
-                self.log(f"下发指令: {text} → {sess.ip_str}")
+            text, ok_dialog = QInputDialog.getText(self, "下发指令", "输入指令内容:")
+            if ok_dialog and text:
+                payload_bytes = text.encode("ascii")
+                threading.Thread(
+                    target=_send_worker,
+                    args=(sess, payload_bytes, f"下发指令: {text} → {sess.ip_str}", f"下发指令失败 → {sess.ip_str}，socket失效"),
+                    daemon=True
+                ).start()
+
         elif action == act_close:
-            sess.close()
+            try:
+                sess.close()
+                self.log(f"主动断开 {sess.ip_str}")
+            except Exception:
+                pass
 
     def on_start(self):
         port = int(self.port_edit.text())
