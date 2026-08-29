@@ -4,7 +4,7 @@ import threading
 from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QLineEdit, QPushButton, QListView, QTextEdit,
-                             QContextMenuEvent, QMenu, QInputDialog, QAbstractItemView)
+                             QMenu, QInputDialog, QAbstractItemView)
 from PyQt6.QtCore import Qt, QAbstractListModel, QVariant
 
 class ClientSession:
@@ -87,6 +87,9 @@ class MainWin(QMainWindow):
         self.list_view = QListView()
         self.list_view.setModel(self.model)
         self.list_view.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        # 开启自定义右键菜单信号
+        self.list_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.list_view.customContextMenuRequested.connect(self.show_right_menu)
         lay.addWidget(self.list_view)
 
         self.log_text = QTextEdit()
@@ -104,7 +107,6 @@ class MainWin(QMainWindow):
                 sess = ClientSession(conn, addr)
                 self.log(f"新被控端接入 {sess.ip_str}")
                 self.model.add(sess)
-                # 接收线程
                 th = threading.Thread(target=self.client_recv_loop, args=(sess,), daemon=True)
                 th.start()
             except Exception:
@@ -118,7 +120,6 @@ class MainWin(QMainWindow):
                 if not data:
                     break
                 buf.extend(data)
-                # 简单按文本处理，以0截断
                 if b'\x00' in buf:
                     parts = buf.split(b'\x00')
                     for part in parts[:-1]:
@@ -131,25 +132,25 @@ class MainWin(QMainWindow):
                 break
         sess.close()
         self.log(f"被控端断开 {sess.ip_str}")
-        # UI线程移除
-        def remove():
-            try:
-                self.model.remove_by_obj(sess)
-            except Exception:
-                pass
-        self.list_view.model().dataChanged.connect(lambda: None)
-        QApplication.instance().postEvent(self.list_view, lambda: remove())
+        # UI线程删除条目
+        idx = -1
+        for i,item in enumerate(self.model.clients):
+            if item is sess:
+                idx = i
+                break
+        if idx != -1:
+            self.model.remove_by_obj(sess)
 
-    def contextMenuEvent(self, event: QContextMenuEvent):
-        idx = self.list_view.currentIndex()
-        if not idx.isValid():
+    def show_right_menu(self, pos):
+        index = self.list_view.indexAt(pos)
+        if not index.isValid():
             return
-        sess: ClientSession = self.model.clients[idx.row()]
+        sess: ClientSession = self.model.clients[index.row()]
         menu = QMenu(self)
         act_ping = menu.addAction("发送 PING")
         act_cmd = menu.addAction("下发自定义指令")
         act_close = menu.addAction("断开连接")
-        action = menu.exec(event.globalPos())
+        action = menu.exec(self.list_view.viewport().mapToGlobal(pos))
         if action == act_ping:
             sess.send(b"PING")
             self.log(f"向 {sess.ip_str} 发送PING")
