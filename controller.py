@@ -5,7 +5,7 @@ from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QLineEdit, QPushButton, QListView, QTextEdit,
                              QMenu, QInputDialog, QAbstractItemView)
-from PyQt6.QtCore import Qt, QAbstractListModel, QVariant
+from PyQt6.QtCore import Qt, QAbstractListModel, QVariant, QModelIndex
 
 class ClientSession:
     def __init__(self, conn: socket.socket, addr):
@@ -34,7 +34,7 @@ class ClientListModel(QAbstractListModel):
         super().__init__()
         self.clients: list[ClientSession] = []
 
-    def rowCount(self, parent=None):
+    def rowCount(self, parent=QModelIndex()):
         return len(self.clients)
 
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
@@ -46,13 +46,14 @@ class ClientListModel(QAbstractListModel):
         return QVariant()
 
     def add(self, sess: ClientSession):
-        self.beginInsertRows(QVariant(), len(self.clients), len(self.clients))
+        # 修复：第一个参数必须是QModelIndex()，不能传QVariant()
+        self.beginInsertRows(QModelIndex(), len(self.clients), len(self.clients))
         self.clients.append(sess)
         self.endInsertRows()
 
     def remove_by_obj(self, sess: ClientSession):
         idx = self.clients.index(sess)
-        self.beginRemoveRows(QVariant(), idx, idx)
+        self.beginRemoveRows(QModelIndex(), idx, idx)
         self.clients.pop(idx)
         self.endRemoveRows()
 
@@ -87,7 +88,6 @@ class MainWin(QMainWindow):
         self.list_view = QListView()
         self.list_view.setModel(self.model)
         self.list_view.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        # 开启自定义右键菜单信号
         self.list_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.list_view.customContextMenuRequested.connect(self.show_right_menu)
         lay.addWidget(self.list_view)
@@ -132,7 +132,6 @@ class MainWin(QMainWindow):
                 break
         sess.close()
         self.log(f"被控端断开 {sess.ip_str}")
-        # UI线程删除条目
         idx = -1
         for i,item in enumerate(self.model.clients):
             if item is sess:
