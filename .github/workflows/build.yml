@@ -32,7 +32,7 @@ jobs:
           .\venv\Scripts\python.exe -c "import cryptography; print('cryptography OK')"
           .\venv\Scripts\python.exe -c "import controller; print('controller OK')"
 
-      # 单行命令，彻底规避cmd ^换行解析bug；只处理PyQt6
+      # 调试用 -c（保留控制台看报错）；正式发布替换为 -w 去掉黑窗口
       - name: PyInstaller build
         shell: cmd
         run: .\venv\Scripts\pyinstaller.exe -F -c controller.py --collect-all PyQt6 --noconfirm
@@ -43,12 +43,12 @@ jobs:
       - name: Validate dist output
         run: |
           if (-not (Test-Path ./dist/controller.exe)) {
-              Write‑Error "dist output missing!"
+              Write-Error "dist output missing!"
               exit 1
           }
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: controller‑exe
+          name: controller-exe
           path: ./dist/controller.exe
