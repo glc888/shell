@@ -1,7 +1,8 @@
 name: Build Controller
+
+# 删掉 push 自动触发；只开启 workflow_dispatch【手动按钮触发】
 on:
-  push:
-    branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   build-windows:
