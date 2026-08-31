@@ -20,10 +20,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 调试构建：-D目录模式，保留控制台，--collect‑all完整打包cryptography全部资源
+      # --windowed 关闭控制台黑框；-D目录模式；--collect‑all cryptography
       - name: PyInstaller compile controller.py
         run: >
           pyinstaller -D
+          --windowed
           --collect-all cryptography
           controller.py
           -n Controller
