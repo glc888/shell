@@ -22,11 +22,17 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pycryptodome PyQt6 pyinstaller
+          python -m pip install pycryptodome PyQt6 pyinstaller
+          python -m pip list
 
-      - name: Test import source code
+      - name: Verify Cryptodome installation
         run: |
-          python -c "import Cryptodome; import Cryptodome.Cipher; import Cryptodome.PublicKey; import controller; print('✅全部导入正常')"
+          python -m pip show pycryptodome
+          python -c "import Cryptodome; print('✅ Cryptodome模块加载成功')"
+
+      - name: Test import controller
+        run: |
+          python -c "import controller; print('✅ controller导入成功')"
 
       - name: PyInstaller build exe
         run: >
