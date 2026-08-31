@@ -1,6 +1,6 @@
 name: Build Controller
 
-# 删掉 push 自动触发；只开启 workflow_dispatch【手动按钮触发】
+# 仅手动按钮触发
 on:
   workflow_dispatch:
 
@@ -23,10 +23,10 @@ jobs:
 
       - name: PyInstaller compile controller.py
         run: |
-          python -m PyInstaller -F -w --collect-all cryptography controller.py -n Controller
+          python -m PyInstaller -w --collect-all cryptography controller.py -n Controller
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: Controller-GUI
-          path: dist/Controller.exe
+          path: dist/Controller/**
