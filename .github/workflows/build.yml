@@ -32,17 +32,22 @@ jobs:
           .\venv\Scripts\python.exe -c "import cryptography; print('cryptography OK')"
           .\venv\Scripts\python.exe -c "import controller; print('controller OK')"
 
-      # 调试用 -c（保留控制台看报错）；正式发布替换为 -w 去掉黑窗口
+      - name: Install UPX
+        uses: crazy-max/ghaction-upx@v3
+        with:
+          install-only: true
+
+      # 移除 --collect‑all PyQt6；-D目录模式；仅手动补qwindows.dll必需平台插件；UPX压缩；-c保留控制台调试
       - name: PyInstaller build
         shell: cmd
-        run: .\venv\Scripts\pyinstaller.exe -F -c controller.py --collect-all PyQt6 --noconfirm
+        run: .\venv\Scripts\pyinstaller.exe -D -c controller.py --add-binary ".\venv\Lib\site-packages\PyQt6\Qt6\plugins\platforms\qwindows.dll;PyQt6\Qt6\plugins\platforms" --upx-dir %UPX_DIR% --noconfirm
 
       - name: Recursively list all files
         run: Get-ChildItem -Recurse . | Format-Table Mode,LastWriteTime,Length,Name
 
       - name: Validate dist output
         run: |
-          if (-not (Test-Path ./dist/controller.exe)) {
+          if (-not (Test-Path ./dist/controller/controller.exe)) {
               Write-Error "dist output missing!"
               exit 1
           }
@@ -51,4 +56,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: controller-exe
-          path: ./dist/controller.exe
+          path: ./dist/controller/
