@@ -1,7 +1,7 @@
 name: Build C2 Controller
 
 on:
-  workflow_dispatch:  # 仅手动点击按钮触发编译
+  workflow_dispatch:
 
 jobs:
   build-windows:
@@ -16,7 +16,7 @@ jobs:
       - name: Compile blob2pem_dll.c → blob2pem.dll
         run: cl /LD /Fe:blob2pem.dll blob2pem_dll.c /MT /link bcrypt.lib crypt32.lib
 
-      - name: List files after compile dll
+      - name: List files
         run: Get-ChildItem
 
       - name: Setup Python
@@ -33,9 +33,7 @@ jobs:
         run: pyinstaller -w -F controller.py -n Controller
 
       - name: Copy artifacts
-        run: |
-          copy dist\Controller.exe .
-          copy blob2pem.dll .
+        run: copy dist\Controller.exe .
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
