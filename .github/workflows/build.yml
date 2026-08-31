@@ -1,11 +1,10 @@
-name: Build Controller
-
-# 仅手动按钮触发
+name: Build Controller EXE
 on:
-  workflow_dispatch:
-
+  push:
+    branches: [ main ]
+  workflow_dispatch:   # ✅网页点按钮手动构建
 jobs:
-  build-windows:
+  build:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -15,18 +14,17 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install python dependencies
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pyinstaller
 
-      - name: PyInstaller compile controller.py
+      - name: PyInstaller build exe
         run: |
-          python -m PyInstaller -w --collect-all cryptography controller.py -n Controller
+          pyinstaller --onefile --windowed --name=Controller controller.py
 
-      - name: Upload build artifacts
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Controller-GUI
-          path: dist/Controller/**
+          name: Controller-exe
+          path: dist/Controller.exe
