@@ -36,7 +36,8 @@ class ClientSession:
 
     def _encrypt_packet(self, plain_data: bytes) -> bytes:
         iv = os_rand.urandom(16)
-        cipher = Cipher(algorithms.AES(self.aes_key), modes.CFB(iv))
+        # 【修复】segment_size=8 bit，与Windows BCrypt CFB保持一致
+        cipher = Cipher(algorithms.AES(self.aes_key), modes.CFB(iv, segment_size=8))
         enc = cipher.encryptor()
         ciphertext = enc.update(plain_data) + enc.finalize()
         return iv + ciphertext
@@ -44,7 +45,8 @@ class ClientSession:
     def _decrypt_packet(self, iv_cipher: bytes) -> bytes:
         iv = iv_cipher[:16]
         ciphertext = iv_cipher[16:]
-        cipher = Cipher(algorithms.AES(self.aes_key), modes.CFB(iv))
+        # 【修复】解密同样 segment_size=8 bit
+        cipher = Cipher(algorithms.AES(self.aes_key), modes.CFB(iv, segment_size=8))
         dec = cipher.decryptor()
         return dec.update(ciphertext) + dec.finalize()
 
@@ -295,7 +297,7 @@ class MainWindow(QMainWindow):
 
     def start_server(self):
         port = int(self.port_edit.text())
-        self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_sock = socket.socket(socket.AF_INET, SOCK_STREAM)
         self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server_sock.bind(("0.0.0.0", port))
         self.server_sock.listen(8)
