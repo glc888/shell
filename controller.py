@@ -8,10 +8,10 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
 from PyQt6.QtCore import Qt, QAbstractListModel, QVariant, QModelIndex, pyqtSignal, QObject, pyqtSlot
 import struct
 
-from Crypto.PublicKey import RSA
-from Crypto.Cipher import AES, PKCS1_v1_5
-from Crypto.Random import get_random_bytes
-from Crypto.Util.Padding import pad, unpad
+from Cryptodome.PublicKey import RSA
+from Cryptodome.Cipher import AES, PKCS1_v1_5
+from Cryptodome.Random import get_random_bytes
+from Cryptodome.Util.Padding import pad, unpad
 
 
 def generate_rsa_keypair(bits: int = 2048) -> RSA.RsaKey:
