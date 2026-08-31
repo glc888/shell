@@ -21,17 +21,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # 去掉-w，带控制台窗口，方便看打包报错；全部写成单行，避开反引号换行bug
       - name: PyInstaller build exe
-        run: |
-          pyinstaller `
-            -w `
-            -n controller `
-            --hidden-import Cryptodome `
-            --hidden-import Cryptodome.Cipher `
-            --hidden-import Cryptodome.PublicKey `
-            --hidden-import Cryptodome.Random `
-            --hidden-import Cryptodome.Util.Padding `
-            controller.py
+        run: pyinstaller -n controller --hidden-import Cryptodome --hidden-import Cryptodome.Cipher --hidden-import Cryptodome.PublicKey --hidden-import Cryptodome.Random --hidden-import Cryptodome.Util.Padding controller.py
+
+      - name: List directory for debug
+        run: ls -Recurse
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
