@@ -3,14 +3,16 @@ import os
 import socket
 import struct
 from datetime import datetime
+
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
 QLabel, QLineEdit, QPushButton, QListView, QTextEdit, QDialog,
-QMenu, QAbstractItemView)
+QMenu, QAbstractItemView, QMessageBox)
 from PyQt6.QtCore import Qt, QAbstractListModel, QVariant, QModelIndex, pyqtSignal, QObject, pyqtSlot, QThread
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import padding
-from cryptography.hazmat.primitives import hashes
+
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import hmac
 from cryptography.hazmat.primitives import padding
 import os as os_rand
 
@@ -25,6 +27,7 @@ class ClientSignals(QObject):
 class AcceptWorker(QObject):
     sig_new_client = pyqtSignal(object)
     sig_log = pyqtSignal(str)
+
     def __init__(self, port, rsa_priv):
         super().__init__()
         self.port = port
@@ -66,6 +69,7 @@ class ClientRecvWorker(QObject):
     sig_disconnect = pyqtSignal(object)
     sig_refresh_model = pyqtSignal(object)
     sig_log = pyqtSignal(str)
+
     def __init__(self, sess):
         super().__init__()
         self.sess = sess
@@ -91,6 +95,7 @@ class ClientRecvWorker(QObject):
                     if not sess.handshake_done:
                         if body_len == 256:
                             try:
+                                # ========= 和agent BCrypt保持一致：OAEP‑SHA1 + MGF1‑SHA1 =========
                                 aes16 = sess.rsa_private.decrypt(
                                     body,
                                     padding.OAEP(
@@ -326,7 +331,6 @@ class MainWindow(QMainWindow):
     @pyqtSlot(object)
     def on_new_client(self, sess:ClientSession):
         self.log(f"新被控端接入 {sess.ip_str}")
-        # 每个客户端单独QThread
         worker = ClientRecvWorker(sess)
         th = QThread()
         worker.moveToThread(th)
@@ -432,6 +436,12 @@ def main():
     else:
         exe_dir = os.path.dirname(os.path.abspath(__file__))
     pem_path = os.path.join(exe_dir, "private.pem")
+
+    if not os.path.exists(pem_path):
+        app_tmp = QApplication(sys.argv)
+        QMessageBox.critical(None,"错误","未找到 private.pem！\n请将私钥文件放到exe同一目录。")
+        sys.exit(1)
+
     with open(pem_path, "rb") as f:
         rsa_private_key = serialization.load_pem_private_key(
             f.read(),
@@ -453,5 +463,5 @@ if __name__ == "__main__":
         else:
             exe_dir = os.path.dirname(os.path.abspath(__file__))
         log_path = os.path.join(exe_dir, "crash.log")
-        with open(log_path, "w", encoding="utf-8") as fp:
+        with open(log_path, "w", encoding="utf‑8") as fp:
             fp.write(traceback.format_exc())
