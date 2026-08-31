@@ -16,17 +16,32 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies from requirements.txt
+      - name: Show root files
+        run: Get-ChildItem
+
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install pycryptodome PyQt6 pyinstaller
 
-      # 去掉-w，带控制台窗口，方便看打包报错；全部写成单行，避开反引号换行bug
+      - name: Test import source code
+        run: |
+          python -c "import Cryptodome; import Cryptodome.Cipher; import Cryptodome.PublicKey; import controller; print('✅全部导入正常')"
+
       - name: PyInstaller build exe
-        run: pyinstaller -n controller --hidden-import Cryptodome --hidden-import Cryptodome.Cipher --hidden-import Cryptodome.PublicKey --hidden-import Cryptodome.Random --hidden-import Cryptodome.Util.Padding controller.py
+        run: >
+          pyinstaller
+          -n controller
+          --hidden-import Cryptodome
+          --hidden-import Cryptodome.Cipher
+          --hidden-import Cryptodome.PublicKey
+          --hidden-import Cryptodome.Random
+          --hidden-import Cryptodome.Util.Padding
+          --collect-submodules Cryptodome
+          controller.py
 
-      - name: List directory for debug
-        run: ls -Recurse
+      - name: Recursively list all files
+        run: Get-ChildItem -Recurse
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
