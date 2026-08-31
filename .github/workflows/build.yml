@@ -1,7 +1,6 @@
 name: Build C2 Controller
 
 on:
-# 删掉 push 分支触发，不再提交代码就自动编译
   workflow_dispatch:  # 仅手动点击按钮触发编译
 
 jobs:
@@ -15,7 +14,10 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
 
       - name: Compile blob2pem_dll.c → blob2pem.dll
-        run: cl /LD blob2pem_dll.c /MT /link bcrypt.lib crypt32.lib
+        run: cl /LD /Fe:blob2pem.dll blob2pem_dll.c /MT /link bcrypt.lib crypt32.lib
+
+      - name: List files after compile dll
+        run: Get-ChildItem
 
       - name: Setup Python
         uses: actions/setup-python@v5
