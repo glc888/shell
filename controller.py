@@ -95,8 +95,14 @@ class RemoteCmdDialog(QDialog):
         self.cmd_input.returnPressed.connect(self.on_enter_command)
         input_lay.addWidget(self.cmd_input)
         lay.addLayout(input_lay)
-        self.out_box.append(f"==== 连接 {self.client.ip_str} 远程 CMD ====\n [*] 已发送 SPAW 启动被控端 cmd.exe")
-        self.client.send_packet(b"SPAW")
+        self.out_box.append(f"==== 连接 {self.client.ip_str} 远程 CMD ====\n")
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.out_box.append("[*] 发送SPAW，启动被控端 cmd.exe")
+        ok = self.client.send_packet(b"SPAW")
+        if not ok:
+            self.out_box.append("[!] SPAW发送失败！")
 
     @pyqtSlot(str)
     def append_text(self, text: str):
@@ -320,8 +326,9 @@ class MainWindow(QMainWindow):
         sess: ClientSession = self.client_model.items[idx.row()]
         menu = QMenu()
         act_open_cmd = menu.addAction("打开远程 CMD 会话")
-        ret = menu.exec(self.view.viewport().mapToGlobal(pos))
-        if ret == act_open_cmd:
+
+        @pyqtSlot()
+        def on_menu_click():
             if sess in self.open_cmd_dialogs:
                 dlg = self.open_cmd_dialogs[sess]
                 if dlg.isVisible():
@@ -333,6 +340,9 @@ class MainWindow(QMainWindow):
             dlg = RemoteCmdDialog(sess, parent=self)
             self.open_cmd_dialogs[sess] = dlg
             dlg.show()
+
+        act_open_cmd.triggered.connect(on_menu_click)
+        menu.exec(self.view.viewport().mapToGlobal(pos))
 
     def closeEvent(self, event):
         self.stop_server()
