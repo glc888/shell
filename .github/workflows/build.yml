@@ -18,40 +18,37 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Create virtual environment
+      - name: Create venv
         run: python -m venv .\venv
 
-      - name: Install dependencies inside venv
+      - name: Install dependencies
         run: |
           .\venv\Scripts\python.exe -m pip install --upgrade pip
-          .\venv\Scripts\python.exe -m pip install pycryptodomex PyQt6 pyinstaller
+          .\venv\Scripts\python.exe -m pip install cryptography PyQt6 pyinstaller
           .\venv\Scripts\python.exe -m pip list
 
-      - name: Verify Cryptodome import inside venv
+      - name: Test import
         run: |
-          .\venv\Scripts\python.exe -c "import Cryptodome; import Cryptodome.Cipher; import Cryptodome.PublicKey; print('Cryptodome import OK')"
+          .\venv\Scripts\python.exe -c "import cryptography; print('cryptography OK')"
+          .\venv\Scripts\python.exe -c "import controller; print('controller OK')"
 
-      - name: Test import controller
-        run: |
-          .\venv\Scripts\python.exe -c "import controller; print('controller import OK')"
-
-      - name: PyInstaller build exe
-        run: >
-          .\venv\Scripts\pyinstaller.exe
-          -n controller
-          --hidden-import Cryptodome
-          --hidden-import Cryptodome.Cipher
-          --hidden-import Cryptodome.PublicKey
-          --hidden-import Cryptodome.Random
-          --hidden-import Cryptodome.Util.Padding
-          --collect-submodules Cryptodome
-          controller.py
+      # 单行命令，彻底规避cmd ^换行解析bug；只处理PyQt6
+      - name: PyInstaller build
+        shell: cmd
+        run: .\venv\Scripts\pyinstaller.exe -F -c controller.py --collect-all PyQt6 --noconfirm
 
       - name: Recursively list all files
-        run: Get-ChildItem -Recurse
+        run: Get-ChildItem -Recurse . | Format-Table Mode,LastWriteTime,Length,Name
+
+      - name: Validate dist output
+        run: |
+          if (-not (Test-Path ./dist/controller.exe)) {
+              Write‑Error "dist output missing!"
+              exit 1
+          }
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: controller-gui-exe
-          path: dist/controller.exe
+          name: controller‑exe
+          path: ./dist/controller.exe
