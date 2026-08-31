@@ -1,30 +1,44 @@
-name: Build Controller EXE
+name: Build C2 Controller
+
 on:
-  push:
-    branches: [ main ]
-  workflow_dispatch:   # ✅网页点按钮手动构建
+# 删掉 push 分支触发，不再提交代码就自动编译
+  workflow_dispatch:  # 仅手动点击按钮触发编译
+
 jobs:
-  build:
+  build-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC compiler
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Compile blob2pem_dll.c → blob2pem.dll
+        run: cl /LD blob2pem_dll.c /MT /link bcrypt.lib crypt32.lib
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install dependencies
+      - name: Install python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: PyInstaller build exe
-        run: |
-          pyinstaller --onefile --windowed --name=Controller controller.py
+      - name: PyInstaller compile controller.py
+        run: pyinstaller -w -F controller.py -n Controller
 
-      - name: Upload artifact
+      - name: Copy artifacts
+        run: |
+          copy dist\Controller.exe .
+          copy blob2pem.dll .
+
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: Controller-exe
-          path: dist/Controller.exe
+          name: c2-build
+          path: |
+            Controller.exe
+            blob2pem.dll
