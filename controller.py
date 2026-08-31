@@ -14,14 +14,8 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives import hashes, hmac
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.backends import default_backend
 
-# ========= 切换工作目录 =========
-if getattr(sys, 'frozen', False):
-    exe_dir = os.path.dirname(sys.executable)
-    os.chdir(exe_dir)
-else:
-    os.chdir(os.path.dirname(os.path.abspath(__file__)))
+# ========= 切换工作目录 移到main入口 =========
 
 def load_resources():
     missing = []
@@ -36,8 +30,8 @@ def load_resources():
         missing.append(dll_path)
     if missing:
         msg = "缺失文件：\n" + "\n".join(missing)
-        QMessageBox.critical(None,"错误", msg)
-        sys.exit(1)
+        print(msg)
+        return None, None, msg
 
     # 读取原始微软BLOB公私钥
     with open(pub_path, "rb") as f:
@@ -46,7 +40,13 @@ def load_resources():
         csp_blob_private = f.read()
 
     # 加载DLL
-    dll = ctypes.CDLL(dll_path)
+    try:
+        dll = ctypes.CDLL(dll_path)
+    except Exception as e:
+        err_msg = f"加载blob2pem.dll失败: {repr(e)}"
+        print(err_msg)
+        return None, None, err_msg
+
     dll.ConvertCspPrivateBlobToPem.argtypes = [ctypes.POINTER(ctypes.c_ubyte), ctypes.c_ulong]
     dll.ConvertCspPrivateBlobToPem.restype = ctypes.c_char_p
     dll.FreeMemory.argtypes = [ctypes.c_void_p]
@@ -54,20 +54,20 @@ def load_resources():
     blob_buf = (ctypes.c_ubyte * len(csp_blob_private)).from_buffer(bytearray(csp_blob_private))
     pem_raw = dll.ConvertCspPrivateBlobToPem(blob_buf, ctypes.c_ulong(len(csp_blob_private)))
     if not pem_raw:
-        QMessageBox.critical(None,"错误","BLOB转换PEM失败")
-        sys.exit(1)
+        err_msg = "BLOB转换PEM失败"
+        print(err_msg)
+        return None, None, err_msg
     pem_bytes = ctypes.string_at(pem_raw)
     dll.FreeMemory(pem_raw)
 
-    private_key = serialization.load_pem_private_key(pem_bytes, password=None, backend=default_backend())
-    return csp_blob_public, private_key
+    private_key = serialization.load_pem_private_key(pem_bytes, password=None)
+    return csp_blob_public, private_key, None
 
-CSP_BLOB_PUBLIC, PRIVATE_KEY = load_resources()
 
 # RSA解密优先OAEP‑SHA1，降级PKCS1‑v15，适配Win7 BCrypt
-def rsa_decrypt_aes_key(cipher_data: bytes) -> bytes:
+def rsa_decrypt_aes_key(private_key, cipher_data: bytes) -> bytes:
     try:
-        plain = PRIVATE_KEY.decrypt(
+        plain = private_key.decrypt(
             cipher_data,
             padding.OAEP(
                 mgf=padding.MGF1(algorithm=hashes.SHA1()),
@@ -77,27 +77,27 @@ def rsa_decrypt_aes_key(cipher_data: bytes) -> bytes:
         )
         return plain
     except Exception:
-        plain = PRIVATE_KEY.decrypt(cipher_data, padding.PKCS1v15())
+        plain = private_key.decrypt(cipher_data, padding.PKCS1v15())
         return plain
 
 # AES‑CFB + HMAC‑SHA256
 def aes_encrypt(plain_data: bytes, aes_key: bytes) -> tuple[bytes, bytes]:
-    iv = default_backend().osrandom_rand_bytes(16)
-    cipher = Cipher(algorithms.AES(aes_key), modes.CFB(iv), backend=default_backend())
+    iv = os.urandom(16)
+    cipher = Cipher(algorithms.AES(aes_key), modes.CFB(iv))
     enc = cipher.encryptor()
     ciphertext = enc.update(plain_data) + enc.finalize()
-    h = hmac.HMAC(aes_key, hashes.SHA256(), backend=default_backend())
+    h = hmac.HMAC(aes_key, hashes.SHA256())
     h.update(iv + ciphertext)
     hmac_val = h.finalize()
     return iv + ciphertext, hmac_val
 
 def aes_decrypt(iv_cipher: bytes, hmac_recv: bytes, aes_key: bytes) -> bytes:
-    h = hmac.HMAC(aes_key, hashes.SHA256(), backend=default_backend())
+    h = hmac.HMAC(aes_key, hashes.SHA256())
     h.update(iv_cipher)
     h.verify(hmac_recv)
     iv = iv_cipher[:16]
     ct = iv_cipher[16:]
-    cipher = Cipher(algorithms.AES(aes_key), modes.CFB(iv), backend=default_backend())
+    cipher = Cipher(algorithms.AES(aes_key), modes.CFB(iv))
     dec = cipher.decryptor()
     return dec.update(ct) + dec.finalize()
 
@@ -108,9 +108,10 @@ class ClientSignals(QObject):
 
 
 class ClientSession:
-    def __init__(self, conn: socket.socket, addr):
+    def __init__(self, conn: socket.socket, addr, csp_blob_public):
         self.conn = conn
         self.addr = addr
+        self.csp_blob_public = csp_blob_public
         self.ip_str = f"{addr[0]}:{addr[1]}"
         self.last_pong = datetime.now()
         self.connected = True
@@ -223,8 +224,10 @@ class ClientListModel(QAbstractListModel):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, csp_blob_public, private_key):
         super().__init__()
+        self.csp_blob_public = csp_blob_public
+        self.private_key = private_key
         self.setWindowTitle("TCP 反向控制端【RSA‑AES‑CFB‑HMAC加密】")
         self.resize(700, 500)
         self.server_sock: socket.socket | None = None
@@ -267,7 +270,7 @@ class MainWindow(QMainWindow):
         while self.server_running:
             try:
                 conn, addr = self.server_sock.accept()
-                sess = ClientSession(conn, addr)
+                sess = ClientSession(conn, addr, self.csp_blob_public)
                 sess.signals.on_outp.connect(self.handle_session_outp)
                 sess.signals.on_disconnect.connect(self.handle_session_disconnect)
                 self.client_model.add(sess)
@@ -293,7 +296,7 @@ class MainWindow(QMainWindow):
 
     def client_recv_loop(self, sess: ClientSession):
         buf = sess._recv_buf
-        sess.send_raw_packet(CSP_BLOB_PUBLIC)
+        sess.send_raw_packet(sess.csp_blob_public)
 
         while sess.connected:
             try:
@@ -313,7 +316,7 @@ class MainWindow(QMainWindow):
                     if not sess.handshake_done:
                         if len(body) == 256:
                             try:
-                                aes_key = rsa_decrypt_aes_key(body)
+                                aes_key = rsa_decrypt_aes_key(self.private_key, body)
                                 if len(aes_key) == 16:
                                     sess.aes_session_key = aes_key
                                     sess.handshake_done = True
@@ -403,7 +406,22 @@ class MainWindow(QMainWindow):
 
 
 if __name__ == "__main__":
+    # 1. 先切换工作目录
+    if getattr(sys, 'frozen', False):
+        exe_dir = os.path.dirname(sys.executable)
+        os.chdir(exe_dir)
+    else:
+        os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
+    # 2. 先创建Qt Application，**必须在load_resources之前！**
     app = QApplication(sys.argv)
-    win = MainWindow()
+
+    # 3. 再加载资源，此时Qt实例已经存在，可以弹窗
+    csp_blob_public, private_key, err = load_resources()
+    if err is not None:
+        QMessageBox.critical(None,"错误", err)
+        sys.exit(1)
+
+    win = MainWindow(csp_blob_public, private_key)
     win.show()
     sys.exit(app.exec())
