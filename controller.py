@@ -13,6 +13,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import hmac
+from cryptography.hazmat.primitives import padding
 import os as os_rand
 
 
@@ -36,19 +37,22 @@ class ClientSession:
 
     def _encrypt_packet(self, plain_data: bytes) -> bytes:
         iv = os_rand.urandom(16)
-        # 【修复】segment_size=8 bit，与Windows BCrypt CFB保持一致
-        cipher = Cipher(algorithms.AES(self.aes_key), modes.CFB(iv, segment_size=8))
+        padder = padding.PKCS7(128).padder()
+        padded = padder.update(plain_data) + padder.finalize()
+        cipher = Cipher(algorithms.AES(self.aes_key), modes.CBC(iv))
         enc = cipher.encryptor()
-        ciphertext = enc.update(plain_data) + enc.finalize()
+        ciphertext = enc.update(padded) + enc.finalize()
         return iv + ciphertext
 
     def _decrypt_packet(self, iv_cipher: bytes) -> bytes:
         iv = iv_cipher[:16]
         ciphertext = iv_cipher[16:]
-        # 【修复】解密同样 segment_size=8 bit
-        cipher = Cipher(algorithms.AES(self.aes_key), modes.CFB(iv, segment_size=8))
+        cipher = Cipher(algorithms.AES(self.aes_key), modes.CBC(iv))
         dec = cipher.decryptor()
-        return dec.update(ciphertext) + dec.finalize()
+        padded_data = dec.update(ciphertext) + dec.finalize()
+        unpadder = padding.PKCS7(128).unpadder()
+        plain = unpadder.update(padded_data) + unpadder.finalize()
+        return plain
 
     def _calc_hmac(self, data: bytes) -> bytes:
         h = hmac.HMAC(self.aes_key, hashes.SHA256())
