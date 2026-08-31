@@ -1,7 +1,5 @@
 name: Build Controller EXE
 on:
-  push:
-    branches: [ main ]
   workflow_dispatch:   # ✅网页点按钮手动构建
 jobs:
   build:
