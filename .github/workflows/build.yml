@@ -7,6 +7,8 @@ on:
 jobs:
   build_controller:
     runs-on: windows-latest
+    env:
+      PYTHONUTF8: 1
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -16,26 +18,26 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Show root files
-        run: Get-ChildItem
+      - name: Create virtual environment
+        run: python -m venv .\venv
 
-      - name: Install dependencies (use pycryptodomex)
+      - name: Install dependencies inside venv
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install pycryptodomex PyQt6 pyinstaller
-          python -m pip list
+          .\venv\Scripts\python.exe -m pip install --upgrade pip
+          .\venv\Scripts\python.exe -m pip install pycryptodomex PyQt6 pyinstaller
+          .\venv\Scripts\python.exe -m pip list
 
-      - name: Verify Cryptodome import
+      - name: Verify Cryptodome import inside venv
         run: |
-          python -c "import Cryptodome; import Cryptodome.Cipher; import Cryptodome.PublicKey; print('✅ Cryptodome加载成功')"
+          .\venv\Scripts\python.exe -c "import Cryptodome; import Cryptodome.Cipher; import Cryptodome.PublicKey; print('Cryptodome import OK')"
 
       - name: Test import controller
         run: |
-          python -c "import controller; print('✅ controller导入成功')"
+          .\venv\Scripts\python.exe -c "import controller; print('controller import OK')"
 
       - name: PyInstaller build exe
         run: >
-          pyinstaller
+          .\venv\Scripts\pyinstaller.exe
           -n controller
           --hidden-import Cryptodome
           --hidden-import Cryptodome.Cipher
