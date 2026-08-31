@@ -1,2 +1,2 @@
 PyQt6>=6.7.0
-cryptography>=43.0.0
+pyinstaller>=6.0
