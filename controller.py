@@ -11,6 +11,9 @@ import struct
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import hmac
+import os as os_rand
 
 
 class ClientSignals(QObject):
@@ -41,13 +44,37 @@ class ClientSession:
         except Exception:
             self.connected = False
 
+    def _encrypt_packet(self, plain_data: bytes) -> bytes:
+        """明文 → IV(16)+AES‑CFB密文"""
+        iv = os_rand.urandom(16)
+        cipher = Cipher(algorithms.AES(self.aes_key), modes.CFB(iv))
+        enc = cipher.encryptor()
+        ciphertext = enc.update(plain_data) + enc.finalize()
+        return iv + ciphertext
+
+    def _decrypt_packet(self, iv_cipher: bytes) -> bytes:
+        """iv(16) + cipher → 明文"""
+        iv = iv_cipher[:16]
+        ciphertext = iv_cipher[16:]
+        cipher = Cipher(algorithms.AES(self.aes_key), modes.CFB(iv))
+        dec = cipher.decryptor()
+        return dec.update(ciphertext) + dec.finalize()
+
+    def _calc_hmac(self, data: bytes) -> bytes:
+        h = hmac.HMAC(self.aes_key, hashes.SHA256())
+        h.update(data)
+        return h.finalize()
+
     def send_packet(self, body: bytes) -> bool:
-        if not self.connected or not self.handshake_done:
+        if not self.connected or not self.handshake_done or self.aes_key is None:
             return False
         try:
-            body_len = len(body)
+            iv_cipher = self._encrypt_packet(body)
+            hmac_val = self._calc_hmac(iv_cipher)
+            enc_body = iv_cipher + hmac_val
+            body_len = len(enc_body)
             header = struct.pack(">I", body_len)
-            packet = header + body
+            packet = header + enc_body
             self.conn.sendall(packet)
             return True
         except (OSError, BrokenPipeError):
@@ -233,7 +260,7 @@ class MainWindow(QMainWindow):
                     if not sess.handshake_done:
                         if body_len == 256:
                             try:
-                                # Windows BCrypt OAEP‑SHA1解密
+                                # Windows CryptoAPI RSA‑OAEP‑SHA1解密
                                 aes16 = sess.rsa_private.decrypt(
                                     body,
                                     padding.OAEP(
@@ -254,14 +281,35 @@ class MainWindow(QMainWindow):
                             sess.close()
                         continue
 
-                    # -------- 握手完成之后，才处理业务包（PING / OUTP等）--------
-                    if len(body)>=4:
-                        cmd_code = body[0:4]
+                    # -------- 握手完成：body = iv_cipher + hmac(32) --------
+                    if body_len < (16 + 32):
+                        self.log(f"[{sess.ip_str}] 加密包长度过短 {body_len}")
+                        sess.close()
+                        continue
+
+                    iv_cipher_part = body[:-32]
+                    recv_hmac = body[-32:]
+                    calc_h = sess._calc_hmac(iv_cipher_part)
+                    if calc_h != recv_hmac:
+                        self.log(f"[{sess.ip_str}] ❌HMAC校验失败，数据包被篡改")
+                        sess.close()
+                        continue
+
+                    try:
+                        plain_body = sess._decrypt_packet(iv_cipher_part)
+                    except Exception as e:
+                        self.log(f"[{sess.ip_str}] AES解密异常 {repr(e)}")
+                        sess.close()
+                        continue
+
+                    # 解析明文命令
+                    if len(plain_body)>=4:
+                        cmd_code = plain_body[0:4]
                         if cmd_code == b"PONG":
                             sess.last_pong = datetime.now()
                             self.client_model.dataChanged.emit(QModelIndex(), QModelIndex())
                         elif cmd_code == b"OUTP":
-                            output_bytes = body[4:]
+                            output_bytes = plain_body[4:]
                             out_text = output_bytes.decode("gbk", errors="replace")
                             sess.signals.on_outp.emit(sess, out_text)
 
