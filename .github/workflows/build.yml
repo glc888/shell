@@ -10,15 +10,6 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Setup MSVC compiler
-        uses: ilammy/msvc-dev-cmd@v1
-
-      - name: Compile blob2pem_dll.c → blob2pem.dll
-        run: cl /LD /Fe:blob2pem.dll blob2pem_dll.c /MT /link bcrypt.lib crypt32.lib
-
-      - name: List files after compile dll
-        run: Get-ChildItem
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -29,19 +20,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 调试构建，不带 -w，保留控制台窗口便于排查崩溃
+      # 调试构建：-D目录模式，保留控制台，--collect‑all完整打包cryptography全部资源
       - name: PyInstaller compile controller.py
         run: >
           pyinstaller -D
-          --collect-binaries cryptography
+          --collect-all cryptography
           controller.py
           -n Controller
-
-      # 只复制编译生成的blob2pem.dll；密钥文件不提交仓库，下载产物后手动放入exe同目录
-      - name: Copy artifacts (only dll)
-        run: |
-          copy blob2pem.dll dist\Controller\
-          Get-ChildItem dist\Controller\
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
