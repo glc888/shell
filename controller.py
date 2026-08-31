@@ -327,8 +327,8 @@ class MainWindow(QMainWindow):
                     try:
                         if len(body) < 16+32:
                             raise Exception("数据包太短")
-                        iv_cipher = body[:‑32]
-                        hmac_recv = body[‑32:]
+                        iv_cipher = body[:-32]
+                        hmac_recv = body[-32:]
                         plain = aes_decrypt(iv_cipher, hmac_recv, sess.aes_session_key)
                     except Exception as e:
                         self.log(f"{sess.ip_str}解密/HMAC校验失败:{e}")
