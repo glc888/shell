@@ -79,7 +79,6 @@ char* ConvertCspPrivateBlobToPem(const unsigned char* priv_blob, ULONG blob_len)
         return NULL;
     }
 
-    // PKCS‑1 PEM头部： -----BEGIN RSA PRIVATE KEY-----
     const char head[] = "-----BEGIN RSA PRIVATE KEY-----\n";
     const char tail[] = "-----END RSA PRIVATE KEY-----\n";
     size_t pem_total = sizeof(head)-1 + b64_len + sizeof(tail)-1 + 1;
@@ -94,11 +93,8 @@ char* ConvertCspPrivateBlobToPem(const unsigned char* priv_blob, ULONG blob_len)
         return NULL;
     }
 
-    snprintf_s(pem_out, pem_total, _TRUNCATE,
-        "%s%s%s",
-        head,
-        b64_buf,
-        tail);
+    // 修复：移除snprintf_s，解决LNK2019链接未定义
+    sprintf(pem_out, "%s%s%s", head, b64_buf, tail);
 
     LocalFree(der_buf);
     LocalFree(b64_buf);
