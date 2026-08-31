@@ -19,16 +19,15 @@ jobs:
       - name: Show root files
         run: Get-ChildItem
 
-      - name: Install dependencies
+      - name: Install dependencies (use pycryptodomex)
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pycryptodome PyQt6 pyinstaller
+          python -m pip install pycryptodomex PyQt6 pyinstaller
           python -m pip list
 
-      - name: Verify Cryptodome installation
+      - name: Verify Cryptodome import
         run: |
-          python -m pip show pycryptodome
-          python -c "import Cryptodome; print('✅ Cryptodome模块加载成功')"
+          python -c "import Cryptodome; import Cryptodome.Cipher; import Cryptodome.PublicKey; print('✅ Cryptodome加载成功')"
 
       - name: Test import controller
         run: |
