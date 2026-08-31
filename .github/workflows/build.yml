@@ -29,16 +29,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # 改动：去掉 -F，使用 -D 目录模式
       - name: PyInstaller compile controller.py
-        run: pyinstaller -w -F controller.py -n Controller
+        run: pyinstaller -w -D controller.py -n Controller
 
+      # 把编译好的 blob2pem.dll 复制进输出目录dist\Controller
       - name: Copy artifacts
-        run: copy dist\Controller.exe .
+        run: |
+          copy blob2pem.dll dist\Controller\
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: c2-build
-          path: |
-            Controller.exe
-            blob2pem.dll
+          # 上传整个程序文件夹
+          path: dist/Controller
