@@ -1,14 +1,13 @@
-name: Build C2 Controller
-
+name: Build Controller
 on:
-  workflow_dispatch:
+  push:
+    branches: [ main ]
 
 jobs:
   build-windows:
     runs-on: windows-latest
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -19,18 +18,14 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install pyinstaller
 
-      # --windowed 关闭控制台黑框；-D目录模式；--collect‑all cryptography
       - name: PyInstaller compile controller.py
-        run: >
-          pyinstaller -D
-          --windowed
-          --collect-all cryptography
-          controller.py
-          -n Controller
+        run: |
+          python -m PyInstaller -F -w --collect-all cryptography controller.py -n Controller
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: c2-build
-          path: dist/Controller
+          name: Controller-GUI
+          path: dist/Controller.exe
