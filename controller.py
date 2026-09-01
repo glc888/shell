@@ -145,14 +145,16 @@ def ws_handle_http_upgrade(sock: socket.socket) -> bool:
         print(f"[ws_handle_http_upgrade]非法请求路径:{path}")
         return False
 
-    # 逐行解析header，key转小写，value strip去除前后空格
+    # ==========修复点：强制转为bytes，杜绝bytearray作为字典key==========
     headers = {}
     for line in buf.split(b"\r\n")[1:]:
         if not line:
             continue
         if b":" in line:
-            k, v = line.split(b":", 1)
-            headers[k.strip().lower()] = v.strip()
+            k_raw, v_raw = line.split(b":", 1)
+            k = bytes(k_raw).strip().lower()
+            v = bytes(v_raw).strip()
+            headers[k] = v
 
     conn_val = headers.get(b"connection", b"")
     upgrade_val = headers.get(b"upgrade", b"")
