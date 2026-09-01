@@ -17,9 +17,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: PyInstaller build exe
+      - name: PyInstaller build exe (DEBUG模式，带控制台窗口)
         run: |
-          pyinstaller --onefile --windowed  --name=Controller controller.py
+          # 删掉 --windowed，开启控制台输出print日志
+          pyinstaller --onefile --name=Controller controller.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
