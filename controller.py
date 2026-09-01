@@ -1,4 +1,5 @@
 import sys
+import os
 import socket
 import threading
 import ssl
@@ -288,6 +289,11 @@ class ClientListModel(QAbstractListModel):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        # 获取exe/脚本所在目录，解决证书相对路径问题
+        self.base_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+        self.crt_path = os.path.join(self.base_dir, "server.crt")
+        self.key_path = os.path.join(self.base_dir, "server.key")
+
         self.setWindowTitle("WS / WSS WebSocket反向控制主控端")
         self.resize(720, 520)
         self.server_sock: socket.socket | None = None
@@ -464,16 +470,19 @@ class MainWindow(QMainWindow):
 
         if use_wss:
             self.ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-            self.ssl_context.load_cert_chain(certfile="server.crt", keyfile="server.key")
-            self.log(f"WSS加密模式启动，监听端口 {port}，需要server.crt/server.key")
+            self.ssl_context.load_cert_chain(certfile=self.crt_path, keyfile=self.key_path)
+            self.log(f"WSS加密模式启动，监听端口 {port}，监听全部网卡 0.0.0.0")
+            self.log(f"crt路径: {self.crt_path}")
+            self.log(f"key路径: {self.key_path}")
+            bind_addr = "0.0.0.0"
         else:
             self.ssl_context = None
-            self.log(f"明文WS模式启动，监听端口 {port}，对接cloudflared隧道")
+            self.log(f"明文WS模式启动，监听端口 {port}，仅本机127.0.0.1（对接cloudflared隧道）")
+            bind_addr = "127.0.0.1"
 
         self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        # ========== 修改：绑定127.0.0.1，仅本机cloudflared可以访问 ==========
-        self.server_sock.bind(("127.0.0.1", port))
+        self.server_sock.bind((bind_addr, port))
         self.server_sock.listen(8)
         self.server_running = True
         threading.Thread(target=self.accept_loop, daemon=True).start()
