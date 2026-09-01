@@ -19,7 +19,7 @@ jobs:
 
       - name: PyInstaller build exe
         run: |
-          pyinstaller --onefile --windowed --name=Controller controller.py
+          pyinstaller --onefile --windowed --collect-binaries PyQt6 --name=Controller controller.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
