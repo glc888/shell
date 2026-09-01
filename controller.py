@@ -145,20 +145,36 @@ def ws_handle_http_upgrade(sock: socket.socket) -> bool:
         print(f"[ws_handle_http_upgrade]非法请求路径:{path}")
         return False
 
-    if b"Upgrade: websocket" not in buf or b"Sec-WebSocket-Key:" not in buf:
-        print("[ws_handle_http_upgrade]缺少WebSocket必要头")
+    # 逐行解析header，key转小写，value strip去除前后空格
+    headers = {}
+    for line in buf.split(b"\r\n")[1:]:
+        if not line:
+            continue
+        if b":" in line:
+            k, v = line.split(b":", 1)
+            headers[k.strip().lower()] = v.strip()
+
+    conn_val = headers.get(b"connection", b"")
+    upgrade_val = headers.get(b"upgrade", b"")
+    ws_key = headers.get(b"sec-websocket-key")
+    ws_version = headers.get(b"sec-websocket-version")
+
+    print(f"[DEBUG] conn_val={conn_val}, upgrade_val={upgrade_val}, ws_key={ws_key}, ws_version={ws_version}")
+
+    if conn_val != b"Upgrade":
+        print("[ws_handle_http_upgrade] Connection头校验失败")
+        return False
+    if upgrade_val != b"websocket":
+        print("[ws_handle_http_upgrade] Upgrade头校验失败")
+        return False
+    if not ws_key:
+        print("[ws_handle_http_upgrade]缺少Sec‑WebSocket‑Key")
+        return False
+    if ws_version != b"13":
+        print(f"[ws_handle_http_upgrade] Sec‑WebSocket‑Version错误:{ws_version}")
         return False
 
-    # 提取 Sec-WebSocket-Key
-    key_line = None
-    for line in buf.split(b"\r\n"):
-        if line.lower().startswith(b"sec-websocket-key:"):
-            key_line = line
-            break
-    if not key_line:
-        print("[ws_handle_http_upgrade]找不到Sec‑WebSocket‑Key")
-        return False
-    client_key = key_line.split(b":", 1)[1].strip()
+    client_key = ws_key
     accept_val = ws_compute_accept(client_key)
 
     resp = (
