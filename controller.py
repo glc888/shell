@@ -2,10 +2,12 @@ import sys
 import socket
 import threading
 import ssl
+import hashlib
+import base64
 from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QLineEdit, QPushButton, QListView, QTextEdit, QDialog,
-                             QMenu, QAbstractItemView)
+                             QMenu, QAbstractItemView, QRadioButton, QButtonGroup)
 from PyQt6.QtCore import Qt, QAbstractListModel, QVariant, QModelIndex, pyqtSignal, QObject, pyqtSlot, QTimer
 import struct
 
@@ -15,6 +17,13 @@ WS_OP_BINARY = 0x02
 WS_OP_CLOSE = 0x08
 WS_OP_PING = 0x09
 WS_OP_PONG = 0x0A
+
+
+def ws_compute_accept(key: bytes) -> bytes:
+    """计算标准Sec‑WebSocket‑Accept应答值"""
+    magic = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+    sha1 = hashlib.sha1(key + magic).digest()
+    return base64.b64encode(sha1)
 
 
 def ws_unmask_payload(payload: bytes, mask_key: bytes) -> bytes:
@@ -101,8 +110,8 @@ def ws_parse_frame(data: bytearray):
     return (fin, opcode, payload, consumed)
 
 
-def ws_handle_http_upgrade(sock: ssl.SSLSocket) -> bool:
-    """处理WebSocket HTTP GET /ws 101升级握手"""
+def ws_handle_http_upgrade(sock: socket.socket) -> bool:
+    """处理WebSocket HTTP GET /ws 101升级握手，兼容普通socket / ssl socket"""
     buf = bytearray()
     sock.settimeout(3.0)
     try:
@@ -120,12 +129,22 @@ def ws_handle_http_upgrade(sock: ssl.SSLSocket) -> bool:
     if b"Upgrade: websocket" not in buf or b"Sec-WebSocket-Key:" not in buf:
         return False
 
-    # 简易应答101 Switching Protocols
+    # 提取 Sec‑WebSocket‑Key
+    key_line = None
+    for line in buf.split(b"\r\n"):
+        if line.lower().startswith(b"sec-websocket-key:"):
+            key_line = line
+            break
+    if not key_line:
+        return False
+    client_key = key_line.split(b":", 1)[1].strip()
+    accept_val = ws_compute_accept(client_key)
+
     resp = (
         b"HTTP/1.1 101 Switching Protocols\r\n"
         b"Upgrade: websocket\r\n"
         b"Connection: Upgrade\r\n"
-        b"Sec-WebSocket-Accept: dummy_accept\r\n"
+        b"Sec-WebSocket-Accept: " + accept_val + b"\r\n"
         b"\r\n"
     )
     try:
@@ -141,8 +160,8 @@ class ClientSignals(QObject):
 
 
 class ClientSession:
-    def __init__(self, ssl_conn: ssl.SSLSocket, addr):
-        self.conn = ssl_conn
+    def __init__(self, conn: socket.socket, addr):
+        self.conn = conn
         self.addr = addr
         self.ip_str = f"{addr[0]}:{addr[1]}"
         self.last_pong = datetime.now()
@@ -269,8 +288,8 @@ class ClientListModel(QAbstractListModel):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("WSS WebSocket反向控制主控端")
-        self.resize(700, 500)
+        self.setWindowTitle("WS / WSS WebSocket反向控制主控端")
+        self.resize(720, 520)
         self.server_sock: socket.socket | None = None
         self.ssl_context = None
         self.server_running = False
@@ -282,10 +301,25 @@ class MainWindow(QMainWindow):
         lay = QVBoxLayout(w)
 
         top_lay = QHBoxLayout()
-        top_lay.addWidget(QLabel("WSS监听端口:"))
-        self.port_edit = QLineEdit("4433")
+        # 模式切换单选
+        self.radio_ws = QRadioButton("明文 WS (cloudflared隧道)")
+        self.radio_wss = QRadioButton("WSS加密 (agent直连)")
+        self.radio_ws.setChecked(True)
+        self.mode_group = QButtonGroup()
+        self.mode_group.addButton(self.radio_ws)
+        self.mode_group.addButton(self.radio_wss)
+        # 切换单选时自动填充默认端口，用户仍可手动修改
+        self.radio_ws.toggled.connect(self.on_mode_switch)
+        self.radio_wss.toggled.connect(self.on_mode_switch)
+
+        top_lay.addWidget(self.radio_ws)
+        top_lay.addWidget(self.radio_wss)
+
+        top_lay.addWidget(QLabel("监听端口:"))
+        self.port_edit = QLineEdit("3306")
         top_lay.addWidget(self.port_edit)
-        self.btn_start = QPushButton("启动WSS监听")
+
+        self.btn_start = QPushButton("启动监听")
         self.btn_start.clicked.connect(self.start_server)
         top_lay.addWidget(self.btn_start)
         self.btn_stop = QPushButton("停止监听")
@@ -310,6 +344,13 @@ class MainWindow(QMainWindow):
         self.ping_timer.setInterval(10000)
         self.ping_timer.timeout.connect(self.broadcast_ping)
 
+    def on_mode_switch(self):
+        """切换模式自动填入默认端口，允许用户手动改写输入框"""
+        if self.radio_ws.isChecked():
+            self.port_edit.setText("3306")
+        else:
+            self.port_edit.setText("4433")
+
     def log(self, msg):
         self.log_box.append(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
@@ -320,28 +361,32 @@ class MainWindow(QMainWindow):
                 sess.send_packet(b"PING")
 
     def accept_loop(self):
+        use_wss = self.radio_wss.isChecked()
         while self.server_running:
             try:
                 raw_conn, addr = self.server_sock.accept()
-                try:
-                    ssl_conn = self.ssl_context.wrap_socket(raw_conn, server_side=True)
-                except ssl.SSLError as e:
-                    self.log(f"TLS握手失败 {addr}: {e}")
-                    raw_conn.close()
-                    continue
+                client_conn = raw_conn
+                # 如果WSS模式，则执行TLS包装
+                if use_wss:
+                    try:
+                        client_conn = self.ssl_context.wrap_socket(raw_conn, server_side=True)
+                    except ssl.SSLError as e:
+                        self.log(f"TLS握手失败 {addr}: {e}")
+                        raw_conn.close()
+                        continue
 
-                # 执行WebSocket HTTP Upgrade握手
-                ok_handshake = ws_handle_http_upgrade(ssl_conn)
+                # WebSocket HTTP Upgrade握手
+                ok_handshake = ws_handle_http_upgrade(client_conn)
                 if not ok_handshake:
                     self.log(f"WebSocket HTTP升级握手失败 {addr}")
-                    ssl_conn.close()
+                    client_conn.close()
                     continue
 
-                sess = ClientSession(ssl_conn, addr)
+                sess = ClientSession(client_conn, addr)
                 sess.signals.on_outp.connect(self.handle_session_outp)
                 sess.signals.on_disconnect.connect(self.handle_session_disconnect)
                 self.client_model.add(sess)
-                self.log(f"[WSS新接入] {sess.ip_str}")
+                self.log(f"[新接入] {sess.ip_str}")
                 t = threading.Thread(target=self.client_recv_loop, args=(sess,), daemon=True)
                 t.start()
             except OSError:
@@ -357,7 +402,7 @@ class MainWindow(QMainWindow):
     def handle_session_disconnect(self, sess: ClientSession):
         if sess in self.open_cmd_dialogs:
             dlg = self.open_cmd_dialogs.pop(sess)
-            dlg.append_text("\n[!] WSS连接已经断开")
+            dlg.append_text("\n[!] WebSocket连接已经断开")
         self.client_model.remove_by_obj(sess)
         self.log(f"[断开] {sess.ip_str}")
 
@@ -415,8 +460,15 @@ class MainWindow(QMainWindow):
 
     def start_server(self):
         port = int(self.port_edit.text())
-        self.ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-        self.ssl_context.load_cert_chain(certfile="server.crt", keyfile="server.key")
+        use_wss = self.radio_wss.isChecked()
+
+        if use_wss:
+            self.ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            self.ssl_context.load_cert_chain(certfile="server.crt", keyfile="server.key")
+            self.log(f"WSS加密模式启动，监听端口 {port}，需要server.crt/server.key")
+        else:
+            self.ssl_context = None
+            self.log(f"明文WS模式启动，监听端口 {port}，对接cloudflared隧道")
 
         self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -429,7 +481,6 @@ class MainWindow(QMainWindow):
 
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
-        self.log(f"WSS WebSocket服务端启动，监听端口 {port}")
 
     def stop_server(self):
         self.ping_timer.stop()
@@ -445,7 +496,7 @@ class MainWindow(QMainWindow):
         self.open_cmd_dialogs.clear()
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
-        self.log("WSS监听已停止")
+        self.log("监听已停止")
 
     def on_context_menu(self, pos):
         idx = self.view.indexAt(pos)
