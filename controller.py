@@ -113,7 +113,7 @@ def ws_parse_frame(data: bytearray):
 
 
 def ws_handle_http_upgrade(sock: socket.socket) -> bool:
-    """处理WebSocket HTTP GET 升级握手，兼容普通socket / ssl socket，适配cloudflared代理探测包"""
+    """处理WebSocket HTTP GET 升级握手，移除MSG_PEEK，修复代理TCP分片报文问题"""
     buf = bytearray()
     start = time.time()
     try:
@@ -121,12 +121,10 @@ def ws_handle_http_upgrade(sock: socket.socket) -> bool:
             if time.time() - start > 10:
                 print("[ws_handle_http_upgrade]握手总超时10s")
                 return False
-            # MSG_PEEK偷看缓冲区，不取出数据
-            peek = sock.recv(1024, socket.MSG_PEEK)
-            if not peek:
+            chunk = sock.recv(1024)
+            if not chunk:
                 time.sleep(0.02)
                 continue
-            chunk = sock.recv(1024)
             buf.extend(chunk)
             if b"\r\n\r\n" in buf:
                 break
@@ -500,7 +498,7 @@ class MainWindow(QMainWindow):
             bind_addr = "0.0.0.0"
         else:
             self.ssl_context = None
-            self.log(f"明文WS模式启动，监听端口 {port}，仅本机127.0.0.1（对接cloudflared隧道）")
+            self.log(f"明文WS模式启动，监听端口 {port}")
             bind_addr = "0.0.0.0"
 
         self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -529,7 +527,6 @@ class MainWindow(QMainWindow):
         self.open_cmd_dialogs.clear()
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
-        self.log("监听已停止")
 
     def on_context_menu(self, pos):
         idx = self.view.indexAt(pos)
