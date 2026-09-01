@@ -6,7 +6,7 @@ from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QLineEdit, QPushButton, QListView, QTextEdit, QDialog,
                              QMenu, QAbstractItemView)
-from PyQt6.QtCore import Qt, QAbstractListModel, QVariant, QModelIndex, pyqtSignal, QObject, pyqtSlot
+from PyQt6.QtCore import Qt, QAbstractListModel, QVariant, QModelIndex, pyqtSignal, QObject, pyqtSlot, QTimer
 import struct
 
 
@@ -17,13 +17,14 @@ class ClientSignals(QObject):
 
 class ClientSession:
     def __init__(self, ssl_conn: ssl.SSLSocket, addr):
-        self.conn = ssl_conn  # 现在是ssl包装后的socket对象
+        self.conn = ssl_conn
         self.addr = addr
         self.ip_str = f"{addr[0]}:{addr[1]}"
         self.last_pong = datetime.now()
         self.connected = True
         self._recv_buf = bytearray()
         self.signals = ClientSignals()
+        self._send_lock = threading.Lock()
 
     def send_packet(self, body: bytes) -> bool:
         if not self.connected:
@@ -32,7 +33,8 @@ class ClientSession:
             body_len = len(body)
             header = struct.pack(">I", body_len)
             packet = header + body
-            self.conn.sendall(packet)
+            with self._send_lock:
+                self.conn.sendall(packet)
             return True
         except (OSError, BrokenPipeError, ssl.SSLError):
             self.close()
@@ -41,7 +43,7 @@ class ClientSession:
     def close(self):
         self.connected = False
         try:
-            self.conn.shutdown()
+            self.conn.shutdown(socket.SHUT_RDWR)
         except Exception:
             pass
         try:
@@ -164,14 +166,24 @@ class MainWindow(QMainWindow):
         self.log_box.setReadOnly(True)
         lay.addWidget(self.log_box)
 
+        # 心跳定时器：10秒发一次PING
+        self.ping_timer = QTimer(self)
+        self.ping_timer.setInterval(10000)
+        self.ping_timer.timeout.connect(self.broadcast_ping)
+
     def log(self, msg):
         self.log_box.append(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+
+    @pyqtSlot()
+    def broadcast_ping(self):
+        for sess in list(self.client_model.items):
+            if sess.connected:
+                sess.send_packet(b"PING")
 
     def accept_loop(self):
         while self.server_running:
             try:
                 raw_conn, addr = self.server_sock.accept()
-                # wrap成SSL socket
                 try:
                     ssl_conn = self.ssl_context.wrap_socket(raw_conn, server_side=True)
                 except ssl.SSLError as e:
@@ -238,7 +250,6 @@ class MainWindow(QMainWindow):
 
     def start_server(self):
         port = int(self.port_edit.text())
-        # 创建TLS上下文，加载证书私钥
         self.ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
         self.ssl_context.load_cert_chain(certfile="server.crt", keyfile="server.key")
 
@@ -248,11 +259,16 @@ class MainWindow(QMainWindow):
         self.server_sock.listen(8)
         self.server_running = True
         threading.Thread(target=self.accept_loop, daemon=True).start()
+        
+        self.ping_timer.start()
+        
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.log(f"TLS服务端启动，监听端口 {port}")
 
     def stop_server(self):
+        self.ping_timer.stop()
+        
         self.server_running = False
         if self.server_sock:
             try:
