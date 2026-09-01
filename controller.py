@@ -112,22 +112,36 @@ def ws_parse_frame(data: bytearray):
 
 
 def ws_handle_http_upgrade(sock: socket.socket) -> bool:
-    """处理WebSocket HTTP GET /ws 101升级握手，兼容普通socket / ssl socket"""
+    """处理WebSocket HTTP GET 升级握手，兼容普通socket / ssl socket"""
     buf = bytearray()
-    sock.settimeout(3.0)
+    # 移除固定3秒timeout，使用原生阻塞socket，cloudflared隧道环境不能设置短超时
     try:
         while True:
             chunk = sock.recv(1024)
             if not chunk:
+                print("[ws_handle_http_upgrade] recv返回空，对端关闭")
                 return False
             buf.extend(chunk)
             if b"\r\n\r\n" in buf:
                 break
-    except Exception:
+    except Exception as e:
+        print(f"[ws_handle_http_upgrade]读取http header异常: {repr(e)}")
         return False
-    sock.settimeout(None)
+
+    # 解析第一行请求行 GET /ws HTTP/1.1
+    first_line = buf.split(b"\r\n")[0]
+    parts = first_line.split(b" ")
+    if len(parts) < 3:
+        print("[ws_handle_http_upgrade] http请求行解析失败")
+        return False
+    method, path, proto = parts
+    # 允许路径 / 和 /ws
+    if path not in (b"/", b"/ws"):
+        print(f"[ws_handle_http_upgrade]非法请求路径:{path}")
+        return False
 
     if b"Upgrade: websocket" not in buf or b"Sec-WebSocket-Key:" not in buf:
+        print("[ws_handle_http_upgrade]缺少WebSocket必要头")
         return False
 
     # 提取 Sec-WebSocket-Key
@@ -137,6 +151,7 @@ def ws_handle_http_upgrade(sock: socket.socket) -> bool:
             key_line = line
             break
     if not key_line:
+        print("[ws_handle_http_upgrade]找不到Sec‑WebSocket‑Key")
         return False
     client_key = key_line.split(b":", 1)[1].strip()
     accept_val = ws_compute_accept(client_key)
@@ -150,7 +165,9 @@ def ws_handle_http_upgrade(sock: socket.socket) -> bool:
     )
     try:
         sock.sendall(resp)
-    except Exception:
+        print(f"[ws_handle_http_upgrade] 101响应已发送, path={path.decode()}")
+    except Exception as e:
+        print(f"[ws_handle_http_upgrade] send 101响应失败: {repr(e)}")
         return False
     return True
 
