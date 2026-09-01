@@ -112,25 +112,28 @@ def ws_parse_frame(data: bytearray):
     return (fin, opcode, payload, consumed)
 
 
-def ws_handle_http_upgrade(sock: socket.socket) -> bool:
-    """处理WebSocket HTTP GET 升级握手，增大缓冲区适配cloudflared长请求头"""
+def ws_handle_http_upgrade(sock: socket.socket) -> tuple[bool, str]:
+    """
+    处理WebSocket HTTP GET 升级握手
+    返回 (成功与否, 真实IP字符串)
+    """
     buf = bytearray()
     start = time.time()
     try:
         while True:
-            if time.time() - start > 20:
-                print("[ws_handle_http_upgrade]握手总超时20s")
-                return False
-            chunk = sock.recv(4096)
+            if time.time() - start > 8:
+                print("[ws_handle_http_upgrade]握手总超时8s")
+                return False, ""
+            chunk = sock.recv(1024)
             if not chunk:
-                time.sleep(0.02)
+                time.sleep(0.01)
                 continue
             buf.extend(chunk)
             if b"\r\n\r\n" in buf:
                 break
     except Exception as e:
         print(f"[ws_handle_http_upgrade]读取http header异常: {repr(e)}")
-        return False
+        return False, ""
 
     print(f"[ws_handle_http_upgrade]收到完整HTTP头:\n{buf.decode('utf-8', errors='replace')}")
 
@@ -138,14 +141,13 @@ def ws_handle_http_upgrade(sock: socket.socket) -> bool:
     parts = first_line.split(b" ")
     if len(parts) < 3:
         print("[ws_handle_http_upgrade] http请求行解析失败")
-        return False
+        return False, ""
     method, path, proto = parts
     # 允许路径 / 和 /ws
     if path not in (b"/", b"/ws"):
         print(f"[ws_handle_http_upgrade]非法请求路径:{path}")
-        return False
+        return False, ""
 
-    # ==========修复点：强制转为bytes，杜绝bytearray作为字典key==========
     headers = {}
     for line in buf.split(b"\r\n")[1:]:
         if not line:
@@ -156,25 +158,28 @@ def ws_handle_http_upgrade(sock: socket.socket) -> bool:
             v = bytes(v_raw).strip()
             headers[k] = v
 
+    # 获取cloudflare真实客户端IP
+    real_ip = headers.get(b"cf-connecting-ip", b"").decode("utf-8").strip()
+
     conn_val = headers.get(b"connection", b"")
     upgrade_val = headers.get(b"upgrade", b"")
     ws_key = headers.get(b"sec-websocket-key")
     ws_version = headers.get(b"sec-websocket-version")
 
-    print(f"[DEBUG] conn_val={conn_val}, upgrade_val={upgrade_val}, ws_key={ws_key}, ws_version={ws_version}")
+    print(f"[DEBUG] conn_val={conn_val}, upgrade_val={upgrade_val}, ws_key={ws_key}, ws_version={ws_version}, cf_ip={real_ip}")
 
     if conn_val != b"Upgrade":
         print("[ws_handle_http_upgrade] Connection头校验失败")
-        return False
+        return False, real_ip
     if upgrade_val != b"websocket":
         print("[ws_handle_http_upgrade] Upgrade头校验失败")
-        return False
+        return False, real_ip
     if not ws_key:
         print("[ws_handle_http_upgrade]缺少Sec‑WebSocket‑Key")
-        return False
+        return False, real_ip
     if ws_version != b"13":
         print(f"[ws_handle_http_upgrade] Sec‑WebSocket‑Version错误:{ws_version}")
-        return False
+        return False, real_ip
 
     client_key = ws_key
     accept_val = ws_compute_accept(client_key)
@@ -191,8 +196,8 @@ def ws_handle_http_upgrade(sock: socket.socket) -> bool:
         print(f"[ws_handle_http_upgrade] 101响应已发送, path={path.decode()}")
     except Exception as e:
         print(f"[ws_handle_http_upgrade] send 101响应失败: {repr(e)}")
-        return False
-    return True
+        return False, real_ip
+    return True, real_ip
 
 
 class ClientSignals(QObject):
@@ -201,10 +206,9 @@ class ClientSignals(QObject):
 
 
 class ClientSession:
-    def __init__(self, conn: socket.socket, addr):
+    def __init__(self, conn: socket.socket, display_ip: str):
         self.conn = conn
-        self.addr = addr
-        self.ip_str = f"{addr[0]}:{addr[1]}"
+        self.ip_str = display_ip
         self.last_pong = datetime.now()
         self.connected = True
         self._recv_buf = bytearray()
@@ -421,14 +425,19 @@ class MainWindow(QMainWindow):
                         raw_conn.close()
                         continue
 
-                # WebSocket HTTP Upgrade握手
-                ok_handshake = ws_handle_http_upgrade(client_conn)
+                ok_handshake, real_ip = ws_handle_http_upgrade(client_conn)
                 if not ok_handshake:
                     self.log(f"WebSocket HTTP升级握手失败 {addr}")
                     client_conn.close()
                     continue
 
-                sess = ClientSession(client_conn, addr)
+                # 优先使用cf‑connecting‑ip；无代理头回退socket地址
+                if real_ip:
+                    display_ip = real_ip
+                else:
+                    display_ip = f"{addr[0]}:{addr[1]}"
+
+                sess = ClientSession(client_conn, display_ip)
                 sess.signals.on_outp.connect(self.handle_session_outp)
                 sess.signals.on_disconnect.connect(self.handle_session_disconnect)
                 self.client_model.add(sess)
@@ -517,8 +526,8 @@ class MainWindow(QMainWindow):
             bind_addr = "0.0.0.0"
         else:
             self.ssl_context = None
-            self.log(f"明文WS模式启动，监听端口 {port}")
-            bind_addr = "0.0.0.0"
+            self.log(f"明文WS模式启动，监听端口 {port}，仅监听127.0.0.1")
+            bind_addr = "127.0.0.1"
 
         self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
