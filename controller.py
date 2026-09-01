@@ -113,15 +113,15 @@ def ws_parse_frame(data: bytearray):
 
 
 def ws_handle_http_upgrade(sock: socket.socket) -> bool:
-    """处理WebSocket HTTP GET 升级握手，移除MSG_PEEK，修复代理TCP分片报文问题"""
+    """处理WebSocket HTTP GET 升级握手，增大缓冲区适配cloudflared长请求头"""
     buf = bytearray()
     start = time.time()
     try:
         while True:
-            if time.time() - start > 10:
-                print("[ws_handle_http_upgrade]握手总超时10s")
+            if time.time() - start > 20:
+                print("[ws_handle_http_upgrade]握手总超时20s")
                 return False
-            chunk = sock.recv(1024)
+            chunk = sock.recv(4096)
             if not chunk:
                 time.sleep(0.02)
                 continue
@@ -132,7 +132,8 @@ def ws_handle_http_upgrade(sock: socket.socket) -> bool:
         print(f"[ws_handle_http_upgrade]读取http header异常: {repr(e)}")
         return False
 
-    # 解析第一行请求行 GET /ws HTTP/1.1
+    print(f"[ws_handle_http_upgrade]收到完整HTTP头:\n{buf.decode('utf-8', errors='replace')}")
+
     first_line = buf.split(b"\r\n")[0]
     parts = first_line.split(b" ")
     if len(parts) < 3:
