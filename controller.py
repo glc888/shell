@@ -5,6 +5,7 @@ import threading
 import ssl
 import hashlib
 import base64
+import time
 from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QLineEdit, QPushButton, QListView, QTextEdit, QDialog,
@@ -112,15 +113,20 @@ def ws_parse_frame(data: bytearray):
 
 
 def ws_handle_http_upgrade(sock: socket.socket) -> bool:
-    """处理WebSocket HTTP GET 升级握手，兼容普通socket / ssl socket"""
+    """处理WebSocket HTTP GET 升级握手，兼容普通socket / ssl socket，适配cloudflared代理探测包"""
     buf = bytearray()
-    # 移除固定3秒timeout，使用原生阻塞socket，cloudflared隧道环境不能设置短超时
+    start = time.time()
     try:
         while True:
-            chunk = sock.recv(1024)
-            if not chunk:
-                print("[ws_handle_http_upgrade] recv返回空，对端关闭")
+            if time.time() - start > 10:
+                print("[ws_handle_http_upgrade]握手总超时10s")
                 return False
+            # MSG_PEEK偷看缓冲区，不取出数据
+            peek = sock.recv(1024, socket.MSG_PEEK)
+            if not peek:
+                time.sleep(0.02)
+                continue
+            chunk = sock.recv(1024)
             buf.extend(chunk)
             if b"\r\n\r\n" in buf:
                 break
@@ -495,7 +501,7 @@ class MainWindow(QMainWindow):
         else:
             self.ssl_context = None
             self.log(f"明文WS模式启动，监听端口 {port}，仅本机127.0.0.1（对接cloudflared隧道）")
-            bind_addr = "127.0.0.1"
+            bind_addr = "0.0.0.0"
 
         self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
