@@ -494,6 +494,16 @@ class MainWindow(QMainWindow):
                         continue
                     elif opcode == WS_OP_CLOSE:
                         break
+                    # ==========新增调试：处理TEXT文本帧(Postman调试用)==========
+                    elif opcode == WS_OP_TEXT:
+                        text_msg = payload.decode("utf-8", errors="replace")
+                        self.log(f"[DEBUG TEXT FRAME] {sess.ip_str} recv text: {text_msg}")
+                        # 回显文本给Postman
+                        resp_frame = ws_build_server_frame(True, WS_OP_TEXT, f"Server echo: {text_msg}".encode("utf-8"))
+                        with sess._send_lock:
+                            sess.conn.sendall(resp_frame)
+                        continue
+                    # ==========================================================
                     elif opcode in (WS_OP_BINARY, WS_OP_CONTINUE):
                         # 处理分片
                         if opcode == WS_OP_BINARY:
