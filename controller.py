@@ -364,7 +364,6 @@ class FileManagerDialog(QDialog):
         self.timer.start()
 
         log_console(f"文件管理打开: {client_session.display_name}")
-        # 不自动发 FDRV，用户点刷新或输入路径时才枚举
         if parent and hasattr(parent, 'is_dark_mode'):
             self.apply_theme(parent.is_dark_mode, parent.fg_color)
 
@@ -743,7 +742,10 @@ class FileManagerDialog(QDialog):
     def closeEvent(self, event):
         self.timer.stop()
         if self.client.connected:
-            self.client.send_packet(b"FABT")
+            ok = self.client.send_packet(b"FABT")
+            log_console(f"[FABT] 已发送, 结果={ok}")
+        else:
+            log_console("[FABT] 连接已断开，未发送")
         self.reset_transfer_state()
         log_console(f"文件管理关闭: {self.client.display_name}")
         super().closeEvent(event)
@@ -965,7 +967,6 @@ class MainWindow(QMainWindow):
                 n += 1
         if n:
             log_console(f"广播 PING 给 {n} 个客户端")
-        # 重新随机下一次触发时间 8-13 秒
         next_ms = random.randint(8000, 13000)
         self.ping_timer.start(next_ms)
 
