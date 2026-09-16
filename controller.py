@@ -21,7 +21,7 @@ WS_OP_CLOSE = 0x08
 WS_OP_PING = 0x09
 WS_OP_PONG = 0x0A
 
-MAX_CHUNK = 4096  # 和agent缓冲区匹配，单分片最大字节
+MAX_CHUNK = 4096
 
 def ws_compute_accept(key: bytes) -> bytes:
     magic = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -284,7 +284,6 @@ class RemoteFileDialog(QDialog):
         self.current_path = b"C:\\"
         self.is_alive = True
 
-        # 下载状态
         self.download_active = False
         self.dst_download_path = ""
         self.download_remote_fullpath = b""
@@ -392,10 +391,6 @@ class RemoteFileDialog(QDialog):
             self.refresh_list()
 
     def parse_list_result(self, body: bytes):
-        """
-        Agent返回格式: is_dir|size|完整绝对路径
-        表格第0列Item存储: 显示文件名，UserRole存储原始完整远程路径字符串
-        """
         text = body.decode("utf-8", errors="replace")
         if text.startswith("ERR:"):
             QMessageBox.warning(self, "错误", f"读取目录失败：{text}")
@@ -409,23 +404,16 @@ class RemoteFileDialog(QDialog):
             if len(parts) !=3:
                 continue
             is_dir_str, size_str, full_remote_path = parts
-
-            # 提取文件名用于UI显示
             if "\\" in full_remote_path:
                 display_name = full_remote_path.rsplit("\\",1)[-1]
             else:
                 display_name = full_remote_path
-
             row = self.table.rowCount()
             self.table.insertRow(row)
-
             item_name = QTableWidgetItem(display_name)
-            # 把agent返回的【完整远程路径】存在UserRole，双击/右键直接读取，不再拼接字符串
             item_name.setData(Qt.ItemDataRole.UserRole, full_remote_path)
-
             item_type = QTableWidgetItem("文件夹" if is_dir_str=="1" else "文件")
             item_size = QTableWidgetItem(size_str)
-
             self.table.setItem(row,0,item_name)
             self.table.setItem(row,1,item_type)
             self.table.setItem(row,2,item_size)
@@ -436,9 +424,7 @@ class RemoteFileDialog(QDialog):
         type_item = self.table.item(row,1)
         full_path_str = name_item.data(Qt.ItemDataRole.UserRole)
         ftype = type_item.text()
-
         if ftype == "文件夹":
-            # 直接使用agent返回的完整路径，不再前端拼接！
             self.current_path = full_path_str.encode("utf-8")
             self.refresh_list()
 
@@ -453,7 +439,6 @@ class RemoteFileDialog(QDialog):
         full_remote_str = name_item.data(Qt.ItemDataRole.UserRole)
         ftype = type_item.text()
         full_remote_bytes = full_remote_str.encode("utf‑8")
-
         menu = QMenu()
         act_download = menu.addAction("下载到本地")
         act_rename = menu.addAction("重命名")
@@ -486,12 +471,10 @@ class RemoteFileDialog(QDialog):
             fullpath = full_remote_str.encode("utf‑8")
             self.client.send_packet(b"DEL_"+fullpath)
 
-    # ========= 重命名 MOVE =========
     def do_rename(self, old_full:bytes, old_name:str):
         new_name, ok = QInputDialog.getText(self,"重命名","输入新名称:", text=old_name)
         if not ok or not new_name.strip():
             return
-        # 获取父目录
         old_str = old_full.decode("utf‑8")
         if "\\" in old_str:
             parent_dir = old_str.rsplit("\\",1)[0] + "\\"
@@ -501,7 +484,6 @@ class RemoteFileDialog(QDialog):
         payload = old_full + b"\x00" + new_full
         self.client.send_packet(b"MOVE" + payload)
 
-    # ========= 下载 READ 分片 =========
     def start_download(self, remote_full:bytes, filename:str):
         save_path, _ = QFileDialog.getSaveFileName(self, "保存文件到本地", filename)
         if not save_path:
@@ -516,7 +498,6 @@ class RemoteFileDialog(QDialog):
     def request_next_download_chunk(self):
         if not self.download_active:
             return
-        # payload: path\0 + offset(uint64) + read_len(uint32)
         path = self.download_remote_fullpath
         payload = path + b"\x00" + struct.pack("<Q", self.download_offset) + struct.pack("<I", MAX_CHUNK)
         self.client.send_packet(b"READ" + payload)
@@ -531,11 +512,9 @@ class RemoteFileDialog(QDialog):
             self.download_active = False
             return
         if len(chunk_data) == 0:
-            # EOF
             self.download_active = False
             QMessageBox.information(self,"下载完成",f"文件已保存：{self.dst_download_path}")
             return
-        # append to file
         try:
             with open(self.dst_download_path,"ab") as f:
                 f.write(chunk_data)
@@ -547,7 +526,6 @@ class RemoteFileDialog(QDialog):
         self.download_offset += len(chunk_data)
         QTimer.singleShot(50, self.request_next_download_chunk)
 
-    # ========= 上传 WRIT 分片 =========
     def do_upload_file(self):
         local_path, _ = QFileDialog.getOpenFileName(self, "选择要上传的本地文件")
         if not local_path:
@@ -565,7 +543,6 @@ class RemoteFileDialog(QDialog):
                     chunk = f.read(MAX_CHUNK)
                     if not chunk:
                         break
-                    # payload: path\0 + offset(uint64) + data
                     payload = remote_full + b"\x00" + struct.pack("<Q", offset) + chunk
                     self.client.send_packet(b"WRIT" + payload)
                     offset += len(chunk)
@@ -721,7 +698,13 @@ class MainWindow(QMainWindow):
             try:
                 raw_conn, addr = self.server_sock.accept()
                 self.log(f"收到TCP连接 {addr}")
-                ok_handshake, ip, country, display_name = ws_handle_http_upgrade(raw_conn)
+                try:
+                    ok_handshake, ip, country, display_name = ws_handle_http_upgrade(raw_conn)
+                except Exception as e:
+                    self.log(f"握手解析异常 {addr} , err:{str(e)}")
+                    raw_conn.close()
+                    continue
+
                 if not ok_handshake:
                     self.log(f"WebSocket握手失败 {addr}")
                     raw_conn.close()
@@ -742,6 +725,8 @@ class MainWindow(QMainWindow):
                 t.start()
             except OSError:
                 break
+            except Exception as e:
+                self.log(f"accept loop 未知异常:{str(e)}")
 
     @pyqtSlot(object, str)
     def handle_session_outp(self, sess: ClientSession, text: str):
@@ -893,7 +878,6 @@ class MainWindow(QMainWindow):
 
 
 if __name__ == "__main__":
-    # pyinstaller打包时，要保留控制台黑框，不要加 --windowed
     app = QApplication(sys.argv)
     win = MainWindow()
     win.show()
