@@ -295,7 +295,7 @@ class RemoteCmdDialog(QDialog):
         log_console(f"CMD会话关闭: {self.client.display_name}")
         if self.client.connected:
             self.client.send_packet(b"KILL")
-        # 断开信号，防止旧对话框继续收数据
+        # 断开信号（虽然 MainWindow 不再直接连 on_outp，保险起见）
         try:
             self.client.signals.on_outp.disconnect(self.append_text)
         except Exception:
@@ -315,6 +315,7 @@ class FileManagerDialog(QDialog):
         self.setWindowTitle(f"远程文件管理 - {client_session.display_name}")
         self.resize(900, 620)
 
+        self._closing = False
         self.current_path = ""
         self.download_buf = bytearray()
         self.download_total = 0
@@ -363,7 +364,7 @@ class FileManagerDialog(QDialog):
         self.log_box.setMaximumHeight(100)
         lay.addWidget(self.log_box)
 
-        client_session.signals.on_fs.connect(self.on_fs_data)
+        # 注意：不在这里连接 on_fs 信号，由 MainWindow 分发
 
         self.timer = QTimer(self)
         self.timer.setInterval(50)
@@ -432,11 +433,15 @@ class FileManagerDialog(QDialog):
         self.log_box.append(msg)
         log_console(f"[文件管理 {self.client.display_name}] {msg}")
 
-    @pyqtSlot(object, bytes)
     def on_fs_data(self, sess, body: bytes):
+        """由 MainWindow 调用，分发 Agent 的文件系统响应"""
+        if self._closing:
+            return
         self.fs_events.append(bytes(body))
 
     def process_fs_events(self):
+        if self._closing:
+            return
         while self.fs_events:
             body = self.fs_events.pop(0)
             self.handle_fs_packet(body)
@@ -754,6 +759,7 @@ class FileManagerDialog(QDialog):
         self.progress_label.setText("")
 
     def closeEvent(self, event):
+        self._closing = True
         self.timer.stop()
         if self.client.connected:
             ok = self.client.send_packet(b"FABT")
@@ -761,12 +767,7 @@ class FileManagerDialog(QDialog):
         else:
             log_console("[FABT] 连接已断开，未发送")
         self.reset_transfer_state()
-        # 断开信号，防止旧对话框继续收数据
-        try:
-            self.client.signals.on_fs.disconnect(self.on_fs_data)
-        except Exception:
-            pass
-        # 从主窗口字典删除自己，避免引用泄漏
+        # 从主窗口字典删除自己
         if self.main_window and self.client in self.main_window.open_file_dialogs:
             if self.main_window.open_file_dialogs[self.client] is self:
                 del self.main_window.open_file_dialogs[self.client]
@@ -1008,6 +1009,8 @@ class MainWindow(QMainWindow):
                 sess = ClientSession(raw_conn, ip, country, display_name)
                 sess.signals.on_outp.connect(self.handle_session_outp)
                 sess.signals.on_disconnect.connect(self.handle_session_disconnect)
+                # 关键：on_fs 由 MainWindow 连接并分发，不由对话框直接连接
+                sess.signals.on_fs.connect(self.handle_session_fs)
                 self.client_model.add(sess)
                 self.log(f"[新接入] {display_name}")
                 threading.Thread(target=self.client_recv_loop, args=(sess,), daemon=True).start()
@@ -1022,6 +1025,13 @@ class MainWindow(QMainWindow):
         if sess in self.open_cmd_dialogs:
             self.open_cmd_dialogs[sess].append_text(text)
 
+    @pyqtSlot(object, bytes)
+    def handle_session_fs(self, sess, body):
+        """把文件系统响应分发给当前活跃的 FileManagerDialog"""
+        dlg = self.open_file_dialogs.get(sess)
+        if dlg is not None and not dlg._closing:
+            dlg.on_fs_data(sess, body)
+
     @pyqtSlot(object)
     def handle_session_disconnect(self, sess):
         log_console(f"[断开] {sess.display_name}")
@@ -1030,6 +1040,7 @@ class MainWindow(QMainWindow):
             dlg.append_text("\n[!] WebSocket连接已经断开")
         if sess in self.open_file_dialogs:
             dlg = self.open_file_dialogs.pop(sess)
+            dlg._closing = True
             dlg.reset_transfer_state()
             dlg.close()
         try:
@@ -1159,6 +1170,7 @@ class MainWindow(QMainWindow):
                 if dlg.isVisible():
                     dlg.raise_(); dlg.activateWindow(); return
                 else:
+                    dlg._closing = True   # 标记旧对话框失效
                     del self.open_file_dialogs[sess]
             dlg = FileManagerDialog(sess, parent=self)
             dlg.apply_theme(self.is_dark_mode, self.fg_color)
