@@ -392,6 +392,10 @@ class RemoteFileDialog(QDialog):
             self.refresh_list()
 
     def parse_list_result(self, body: bytes):
+        """
+        Agent返回格式: is_dir|size|完整绝对路径
+        表格第0列Item存储: 显示文件名，UserRole存储原始完整远程路径字符串
+        """
         text = body.decode("utf-8", errors="replace")
         if text.startswith("ERR:"):
             QMessageBox.warning(self, "错误", f"读取目录失败：{text}")
@@ -404,12 +408,24 @@ class RemoteFileDialog(QDialog):
             parts = line.split("|")
             if len(parts) !=3:
                 continue
-            is_dir_str, size_str, fname = parts
+            is_dir_str, size_str, full_remote_path = parts
+
+            # 提取文件名用于UI显示
+            if "\\" in full_remote_path:
+                display_name = full_remote_path.rsplit("\\",1)[-1]
+            else:
+                display_name = full_remote_path
+
             row = self.table.rowCount()
             self.table.insertRow(row)
-            item_name = QTableWidgetItem(fname)
+
+            item_name = QTableWidgetItem(display_name)
+            # 把agent返回的【完整远程路径】存在UserRole，双击/右键直接读取，不再拼接字符串
+            item_name.setData(Qt.ItemDataRole.UserRole, full_remote_path)
+
             item_type = QTableWidgetItem("文件夹" if is_dir_str=="1" else "文件")
             item_size = QTableWidgetItem(size_str)
+
             self.table.setItem(row,0,item_name)
             self.table.setItem(row,1,item_type)
             self.table.setItem(row,2,item_size)
@@ -418,12 +434,12 @@ class RemoteFileDialog(QDialog):
         row = index.row()
         name_item = self.table.item(row,0)
         type_item = self.table.item(row,1)
-        fname = name_item.text()
+        full_path_str = name_item.data(Qt.ItemDataRole.UserRole)
         ftype = type_item.text()
+
         if ftype == "文件夹":
-            current = self.current_path.decode("utf-8")
-            new_path = (current + fname + "\\").encode("utf-8")
-            self.current_path = new_path
+            # 直接使用agent返回的完整路径，不再前端拼接！
+            self.current_path = full_path_str.encode("utf-8")
             self.refresh_list()
 
     def on_table_right_menu(self, pos):
@@ -433,9 +449,10 @@ class RemoteFileDialog(QDialog):
         row = idx.row()
         name_item = self.table.item(row,0)
         type_item = self.table.item(row,1)
-        filename = name_item.text()
+        filename_display = name_item.text()
+        full_remote_str = name_item.data(Qt.ItemDataRole.UserRole)
         ftype = type_item.text()
-        full_remote = (self.current_path.decode("utf‑8") + filename).encode("utf‑8")
+        full_remote_bytes = full_remote_str.encode("utf‑8")
 
         menu = QMenu()
         act_download = menu.addAction("下载到本地")
@@ -445,9 +462,9 @@ class RemoteFileDialog(QDialog):
             if ftype == "文件夹":
                 QMessageBox.warning(self,"提示","暂不支持文件夹下载，仅支持单个文件")
                 return
-            self.start_download(full_remote, filename)
+            self.start_download(full_remote_bytes, filename_display)
         elif ret == act_rename:
-            self.do_rename(full_remote, filename)
+            self.do_rename(full_remote_bytes, filename_display)
 
     def new_folder(self):
         name, ok = QInputDialog.getText(self, "新建文件夹", "文件夹名称:")
@@ -464,8 +481,9 @@ class RemoteFileDialog(QDialog):
         if reply != QMessageBox.StandardButton.Yes:
             return
         for r in rows:
-            fname = self.table.item(r,0).text()
-            fullpath = (self.current_path.decode("utf‑8") + fname).encode("utf‑8")
+            name_item = self.table.item(r,0)
+            full_remote_str = name_item.data(Qt.ItemDataRole.UserRole)
+            fullpath = full_remote_str.encode("utf‑8")
             self.client.send_packet(b"DEL_"+fullpath)
 
     # ========= 重命名 MOVE =========
@@ -473,8 +491,13 @@ class RemoteFileDialog(QDialog):
         new_name, ok = QInputDialog.getText(self,"重命名","输入新名称:", text=old_name)
         if not ok or not new_name.strip():
             return
-        base_dir = self.current_path.decode("utf‑8")
-        new_full = (base_dir + new_name.strip()).encode("utf‑8")
+        # 获取父目录
+        old_str = old_full.decode("utf‑8")
+        if "\\" in old_str:
+            parent_dir = old_str.rsplit("\\",1)[0] + "\\"
+        else:
+            parent_dir = old_str
+        new_full = (parent_dir + new_name.strip()).encode("utf‑8")
         payload = old_full + b"\x00" + new_full
         self.client.send_packet(b"MOVE" + payload)
 
