@@ -6,6 +6,7 @@ import hashlib
 import base64
 import time
 import struct
+import random
 from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QLineEdit, QPushButton, QListView, QTextEdit, QDialog,
@@ -363,7 +364,7 @@ class FileManagerDialog(QDialog):
         self.timer.start()
 
         log_console(f"文件管理打开: {client_session.display_name}")
-        self.client.send_packet(b"FDRV")
+        # 不自动发 FDRV，用户点刷新或输入路径时才枚举
         if parent and hasattr(parent, 'is_dark_mode'):
             self.apply_theme(parent.is_dark_mode, parent.fg_color)
 
@@ -779,7 +780,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.base_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
         self.is_dark_mode = False
-        self.fg_color = "#00ff00"  # 默认亮绿
+        self.fg_color = "#00ff00"
 
         self.setWindowTitle("WebSocket 反向控制主控端 (Cloudflared Tunnel 模式)")
         self.resize(720, 520)
@@ -821,7 +822,7 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.log_box)
 
         self.ping_timer = QTimer(self)
-        self.ping_timer.setInterval(10000)
+        self.ping_timer.setSingleShot(True)
         self.ping_timer.timeout.connect(self.broadcast_ping)
 
         self.apply_theme(False)
@@ -964,6 +965,9 @@ class MainWindow(QMainWindow):
                 n += 1
         if n:
             log_console(f"广播 PING 给 {n} 个客户端")
+        # 重新随机下一次触发时间 8-13 秒
+        next_ms = random.randint(8000, 13000)
+        self.ping_timer.start(next_ms)
 
     def accept_loop(self):
         while self.server_running:
@@ -1086,7 +1090,7 @@ class MainWindow(QMainWindow):
             return
         self.server_running = True
         threading.Thread(target=self.accept_loop, daemon=True).start()
-        self.ping_timer.start()
+        self.ping_timer.start(random.randint(8000, 13000))
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.log(f"启动 Cloudflared Tunnel 模式，监听 127.0.0.1:{port}")
