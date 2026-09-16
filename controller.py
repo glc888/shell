@@ -10,7 +10,7 @@ from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QLineEdit, QPushButton, QListView, QTextEdit, QDialog,
                              QMenu, QAbstractItemView, QTreeWidget, QTreeWidgetItem,
-                             QInputDialog, QFileDialog)
+                             QInputDialog, QFileDialog, QProgressBar)
 from PyQt6.QtCore import Qt, QAbstractListModel, QVariant, QModelIndex, pyqtSignal, QObject, pyqtSlot, QTimer
 from PyQt6.QtGui import QColor, QPalette
 
@@ -22,10 +22,20 @@ WS_OP_PING = 0x09
 WS_OP_PONG = 0x0A
 
 FILE_CHUNK = 32768
+UPLOAD_WINDOW = 8
+
+# ============ 夜间模式 CMD 配色 ============
+DARK_BG = "#000000"          # 纯黑背景
+DARK_FG = "#00ff00"          # 亮绿文字
+DARK_SEL_BG = "#003300"      # 选中项背景（深绿）
+DARK_BORDER = "#00aa00"      # 边框绿
+DARK_BTN_BG = "#0a0a0a"      # 按钮背景（近黑）
+DARK_BTN_HOVER = "#003300"   # 按钮悬停
+DARK_DISABLED = "#005500"    # 禁用文字
+DARK_PROGRESS_CHUNK = "#00aa00"  # 进度条填充
 
 
 def log_console(msg: str):
-    """所有调试信息统一输出到控制台窗口"""
     ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     print(f"[{ts}] {msg}", flush=True)
 
@@ -244,11 +254,21 @@ class RemoteCmdDialog(QDialog):
 
     def apply_theme(self, dark: bool):
         if dark:
-            self.setStyleSheet("""
-                QDialog { background-color: #1e1e1e; }
-                QLabel { color: #d4d4d4; }
-                QTextEdit { background-color: #2d2d2d; color: #d4d4d4; border: 1px solid #3d3d3d; }
-                QLineEdit { background-color: #2d2d2d; color: #d4d4d4; border: 1px solid #3d3d3d; }
+            self.setStyleSheet(f"""
+                QDialog {{ background-color: {DARK_BG}; }}
+                QLabel {{ color: {DARK_FG}; }}
+                QTextEdit {{
+                    background-color: {DARK_BG};
+                    color: {DARK_FG};
+                    border: 1px solid {DARK_BORDER};
+                    font-family: Consolas, "Courier New", monospace;
+                }}
+                QLineEdit {{
+                    background-color: {DARK_BG};
+                    color: {DARK_FG};
+                    border: 1px solid {DARK_BORDER};
+                    font-family: Consolas, "Courier New", monospace;
+                }}
             """)
         else:
             self.setStyleSheet("")
@@ -287,7 +307,7 @@ class FileManagerDialog(QDialog):
         self.main_window = parent
         self.client = client_session
         self.setWindowTitle(f"远程文件管理 - {client_session.display_name}")
-        self.resize(900, 600)
+        self.resize(900, 620)
 
         self.current_path = ""
         self.download_buf = bytearray()
@@ -296,6 +316,8 @@ class FileManagerDialog(QDialog):
         self.upload_file = None
         self.upload_total = 0
         self.upload_sent = 0
+        self.upload_acked = 0
+        self.upload_inflight = 0
         self.upload_path = ""
         self.fs_events = []
 
@@ -310,6 +332,16 @@ class FileManagerDialog(QDialog):
         btn_refresh = QPushButton("刷新"); btn_refresh.clicked.connect(self.on_refresh); path_lay.addWidget(btn_refresh)
         lay.addLayout(path_lay)
 
+        self.progress_label = QLabel("")
+        lay.addWidget(self.progress_label)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setMaximumHeight(18)
+        lay.addWidget(self.progress_bar)
+
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["名称", "大小", "类型", "完整路径"])
         self.tree.setColumnWidth(0, 260)
@@ -322,7 +354,7 @@ class FileManagerDialog(QDialog):
 
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
-        self.log_box.setMaximumHeight(120)
+        self.log_box.setMaximumHeight(100)
         lay.addWidget(self.log_box)
 
         client_session.signals.on_fs.connect(self.on_fs_data)
@@ -339,13 +371,54 @@ class FileManagerDialog(QDialog):
 
     def apply_theme(self, dark: bool):
         if dark:
-            self.setStyleSheet("""
-                QDialog { background-color: #1e1e1e; }
-                QLabel { color: #d4d4d4; }
-                QLineEdit { background-color: #2d2d2d; color: #d4d4d4; border: 1px solid #3d3d3d; }
-                QTreeWidget { background-color: #2d2d2d; color: #d4d4d4; border: 1px solid #3d3d3d; }
-                QTextEdit { background-color: #2d2d2d; color: #d4d4d4; border: 1px solid #3d3d3d; }
-                QPushButton { background-color: #3d3d3d; color: #d4d4d4; border: 1px solid #4d4d4d; padding: 4px 10px; }
+            self.setStyleSheet(f"""
+                QDialog {{ background-color: {DARK_BG}; }}
+                QLabel {{ color: {DARK_FG}; }}
+                QLineEdit {{
+                    background-color: {DARK_BG};
+                    color: {DARK_FG};
+                    border: 1px solid {DARK_BORDER};
+                    font-family: Consolas, "Courier New", monospace;
+                }}
+                QTreeWidget {{
+                    background-color: {DARK_BG};
+                    color: {DARK_FG};
+                    border: 1px solid {DARK_BORDER};
+                    font-family: Consolas, "Courier New", monospace;
+                }}
+                QTreeWidget::item:selected {{
+                    background-color: {DARK_SEL_BG};
+                    color: {DARK_FG};
+                }}
+                QTreeWidget QHeaderView::section {{
+                    background-color: {DARK_BG};
+                    color: {DARK_FG};
+                    border: 1px solid {DARK_BORDER};
+                    padding: 3px;
+                }}
+                QTextEdit {{
+                    background-color: {DARK_BG};
+                    color: {DARK_FG};
+                    border: 1px solid {DARK_BORDER};
+                    font-family: Consolas, "Courier New", monospace;
+                }}
+                QPushButton {{
+                    background-color: {DARK_BTN_BG};
+                    color: {DARK_FG};
+                    border: 1px solid {DARK_BORDER};
+                    padding: 4px 10px;
+                    font-family: Consolas, "Courier New", monospace;
+                }}
+                QPushButton:hover {{ background-color: {DARK_BTN_HOVER}; }}
+                QPushButton:disabled {{ color: {DARK_DISABLED}; }}
+                QProgressBar {{
+                    background-color: {DARK_BG};
+                    color: {DARK_FG};
+                    border: 1px solid {DARK_BORDER};
+                    text-align: center;
+                    font-family: Consolas, "Courier New", monospace;
+                }}
+                QProgressBar::chunk {{ background-color: {DARK_PROGRESS_CHUNK}; }}
             """)
         else:
             self.setStyleSheet("")
@@ -374,7 +447,6 @@ class FileManagerDialog(QDialog):
             log_console(f"[文件管理] 收到驱动器列表: {drives}")
             self.tree.clear()
             for d in drives:
-                # 补上反斜杠，方便双击进入
                 d_full = d if d.endswith("\\") else d + "\\"
                 item = QTreeWidgetItem([d_full, "", "驱动器", d_full])
                 self.tree.addTopLevelItem(item)
@@ -405,6 +477,9 @@ class FileManagerDialog(QDialog):
                 self.download_total = int(parts[1])
                 self.download_buf = bytearray()
                 log_console(f"[下载] 开始 {self.download_name}, 总大小={self.download_total}")
+                self.progress_bar.setValue(0)
+                self.progress_label.setText(
+                    f"[下载] {self.download_name} 0 / {self.format_size(self.download_total)}")
 
         elif cmd == b"FDAT":
             if len(payload) < 8: return
@@ -413,32 +488,62 @@ class FileManagerDialog(QDialog):
             if offset == len(self.download_buf):
                 self.download_buf.extend(data)
             else:
-                log_console(f"[下载] 偏移异常 offset={offset} buf_len={len(self.download_buf)}")
-                # 容错：按偏移拼接
                 if offset > len(self.download_buf):
                     self.download_buf.extend(b"\x00" * (offset - len(self.download_buf)))
                 self.download_buf[offset:offset+len(data)] = data
-            # 不再用 total 判断结束，等 FDON
+            if self.download_total > 0:
+                pct = len(self.download_buf) * 100 // self.download_total
+                if pct > 100: pct = 100
+                self.progress_bar.setValue(pct)
+                self.progress_label.setText(
+                    f"[下载] {self.format_size(len(self.download_buf))} / "
+                    f"{self.format_size(self.download_total)} ({pct}%)")
+
+        elif cmd == b"FPRO":
+            if len(payload) >= 12:
+                prog = struct.unpack("<Q", payload[0:8])[0]
+                tot = struct.unpack("<I", payload[8:12])[0]
+                if tot > 0:
+                    pct = prog * 100 // tot
+                    if pct > 100: pct = 100
+                    self.progress_bar.setValue(pct)
+                    self.progress_label.setText(
+                        f"[下载] {self.format_size(prog)} / "
+                        f"{self.format_size(tot)} ({pct}%)")
 
         elif cmd == b"FDON":
-            # Agent 发来的结束标记
             if len(payload) >= 8:
                 server_total = struct.unpack("<Q", payload[0:8])[0]
             else:
                 server_total = self.download_total
             log_console(f"[下载] 收到结束标记 FDON, 实际收到={len(self.download_buf)}, "
                         f"声明总大小={server_total}")
+            self.progress_bar.setValue(100)
             self.finish_download()
 
         elif cmd == b"FACK":
             if len(payload) >= 8:
-                offset = struct.unpack("<Q", payload[0:8])[0]
-                self.upload_sent = offset
+                if self.upload_inflight > 0:
+                    self.upload_inflight -= 1
+                self.upload_acked += 1
                 if self.upload_file and self.upload_sent < self.upload_total:
                     self.send_next_upload_chunk()
+                elif (self.upload_sent >= self.upload_total
+                      and self.upload_inflight == 0
+                      and self.upload_file):
+                    self.upload_file.close()
+                    self.upload_file = None
+                    log_console(f"[上传完成] {self.upload_path} ({self.upload_total} 字节)")
+                    self.log("[上传完成]")
+                    self.progress_bar.setValue(100)
+                    self.progress_label.setText(
+                        f"[上传完成] {self.format_size(self.upload_total)}")
+                    QTimer.singleShot(500, self.on_refresh)
 
         elif cmd == b"FOK":
             log_console("[文件管理] 收到 FOK")
+            if self.upload_file and self.upload_sent == 0:
+                self.send_next_upload_chunk()
 
         elif cmd == b"FERR":
             msg = payload.decode("gbk", errors="replace")
@@ -451,6 +556,8 @@ class FileManagerDialog(QDialog):
             self.download_buf = bytearray()
             self.download_total = 0
             self.download_name = ""
+            self.progress_bar.setValue(0)
+            self.progress_label.setText("")
             return
         save_path, _ = QFileDialog.getSaveFileName(self, "保存文件", self.download_name)
         if save_path:
@@ -468,6 +575,8 @@ class FileManagerDialog(QDialog):
         self.download_buf = bytearray()
         self.download_total = 0
         self.download_name = ""
+        self.progress_bar.setValue(0)
+        self.progress_label.setText("")
 
     @staticmethod
     def format_size(n):
@@ -475,6 +584,16 @@ class FileManagerDialog(QDialog):
             if n < 1024: return f"{n:.1f} {unit}"
             n /= 1024
         return f"{n:.1f} PB"
+
+    def update_upload_progress(self):
+        if self.upload_total > 0:
+            pct = self.upload_sent * 100 // self.upload_total
+            if pct > 100: pct = 100
+            self.progress_bar.setValue(pct)
+            self.progress_label.setText(
+                f"[上传] {self.format_size(self.upload_sent)} / "
+                f"{self.format_size(self.upload_total)} ({pct}%) "
+                f"在途={self.upload_inflight}")
 
     def on_go(self):
         path = self.path_edit.text().strip()
@@ -567,30 +686,46 @@ class FileManagerDialog(QDialog):
             self.log(f"[上传失败] {e}"); return
         self.upload_total = os.path.getsize(local_path)
         self.upload_sent = 0
+        self.upload_acked = 0
+        self.upload_inflight = 0
         self.upload_path = remote_path
         args = f"{remote_path}|{self.upload_total}"
         log_console(f"[上传] 开始 {fname} ({self.upload_total} 字节) -> {remote_path}")
         self.client.send_packet(b"FPUT" + args.encode("gbk", errors="replace"))
         self.log(f"[上传] {fname} ({self.upload_total} 字节) -> {remote_path}")
+        self.progress_bar.setValue(0)
+        self.progress_label.setText(
+            f"[上传] 0 / {self.format_size(self.upload_total)} (0%)")
 
     def send_next_upload_chunk(self):
-        if not self.upload_file: return
-        chunk = self.upload_file.read(FILE_CHUNK)
-        if not chunk:
+        while (self.upload_file
+               and self.upload_inflight < UPLOAD_WINDOW
+               and self.upload_sent < self.upload_total):
+            chunk = self.upload_file.read(FILE_CHUNK)
+            if not chunk:
+                break
+            offset = self.upload_sent
+            body = b"FDAT" + struct.pack("<Q", offset) + chunk
+            if not self.client.send_packet(body):
+                log_console(f"[上传失败] 发送分块失败 offset={offset}")
+                break
+            self.upload_sent += len(chunk)
+            self.upload_inflight += 1
+            self.update_upload_progress()
+
+        if (self.upload_sent >= self.upload_total
+            and self.upload_inflight == 0
+            and self.upload_file):
             self.upload_file.close()
             self.upload_file = None
             log_console(f"[上传完成] {self.upload_path} ({self.upload_total} 字节)")
             self.log("[上传完成]")
+            self.progress_bar.setValue(100)
+            self.progress_label.setText(
+                f"[上传完成] {self.format_size(self.upload_total)}")
             QTimer.singleShot(500, self.on_refresh)
-            return
-        offset = self.upload_sent
-        body = b"FDAT" + struct.pack("<Q", offset) + chunk
-        ok = self.client.send_packet(body)
-        if not ok:
-            log_console(f"[上传失败] 发送分块失败 offset={offset}")
 
     def reset_transfer_state(self):
-        """断连时清理状态"""
         self.download_buf = bytearray()
         self.download_total = 0
         self.download_name = ""
@@ -600,7 +735,11 @@ class FileManagerDialog(QDialog):
         self.upload_file = None
         self.upload_total = 0
         self.upload_sent = 0
+        self.upload_acked = 0
+        self.upload_inflight = 0
         self.upload_path = ""
+        self.progress_bar.setValue(0)
+        self.progress_label.setText("")
 
     def closeEvent(self, event):
         self.timer.stop()
@@ -686,20 +825,106 @@ class MainWindow(QMainWindow):
     def apply_theme(self, dark: bool):
         self.is_dark_mode = dark
         if dark:
-            self.setStyleSheet("""
-                QMainWindow { background-color: #1e1e1e; }
-                QWidget { background-color: #1e1e1e; }
-                QLabel { color: #d4d4d4; }
-                QLineEdit { background-color: #2d2d2d; color: #d4d4d4; border: 1px solid #3d3d3d; padding: 4px; }
-                QPushButton { background-color: #3d3d3d; color: #d4d4d4; border: 1px solid #4d4d4d; padding: 5px 15px; }
-                QPushButton:hover { background-color: #4d4d4d; }
-                QPushButton:disabled { color: #666; background-color: #2d2d2d; }
-                QListView { background-color: #2d2d2d; color: #d4d4d4; border: 1px solid #3d3d3d; }
-                QListView::item:selected { background-color: #3d7a9e; }
-                QTextEdit { background-color: #2d2d2d; color: #d4d4d4; border: 1px solid #3d3d3d; }
-                QMenu { background-color: #2d2d2d; color: #d4d4d4; border: 1px solid #3d3d3d; }
-                QMenu::item:selected { background-color: #3d7a9e; }
-                QTreeWidget { background-color: #2d2d2d; color: #d4d4d4; border: 1px solid #3d3d3d; }
+            self.setStyleSheet(f"""
+                QMainWindow {{ background-color: {DARK_BG}; }}
+                QWidget {{ background-color: {DARK_BG}; color: {DARK_FG}; }}
+                QLabel {{ color: {DARK_FG}; }}
+                QLineEdit {{
+                    background-color: {DARK_BG};
+                    color: {DARK_FG};
+                    border: 1px solid {DARK_BORDER};
+                    padding: 4px;
+                    font-family: Consolas, "Courier New", monospace;
+                }}
+                QPushButton {{
+                    background-color: {DARK_BTN_BG};
+                    color: {DARK_FG};
+                    border: 1px solid {DARK_BORDER};
+                    padding: 5px 15px;
+                    font-family: Consolas, "Courier New", monospace;
+                }}
+                QPushButton:hover {{ background-color: {DARK_BTN_HOVER}; }}
+                QPushButton:disabled {{ color: {DARK_DISABLED}; }}
+                QListView {{
+                    background-color: {DARK_BG};
+                    color: {DARK_FG};
+                    border: 1px solid {DARK_BORDER};
+                    font-family: Consolas, "Courier New", monospace;
+                }}
+                QListView::item:selected {{
+                    background-color: {DARK_SEL_BG};
+                    color: {DARK_FG};
+                }}
+                QTextEdit {{
+                    background-color: {DARK_BG};
+                    color: {DARK_FG};
+                    border: 1px solid {DARK_BORDER};
+                    font-family: Consolas, "Courier New", monospace;
+                }}
+                QMenu {{
+                    background-color: {DARK_BG};
+                    color: {DARK_FG};
+                    border: 1px solid {DARK_BORDER};
+                    font-family: Consolas, "Courier New", monospace;
+                }}
+                QMenu::item:selected {{
+                    background-color: {DARK_SEL_BG};
+                    color: {DARK_FG};
+                }}
+                QTreeWidget {{
+                    background-color: {DARK_BG};
+                    color: {DARK_FG};
+                    border: 1px solid {DARK_BORDER};
+                    font-family: Consolas, "Courier New", monospace;
+                }}
+                QTreeWidget::item:selected {{
+                    background-color: {DARK_SEL_BG};
+                    color: {DARK_FG};
+                }}
+                QTreeWidget QHeaderView::section {{
+                    background-color: {DARK_BG};
+                    color: {DARK_FG};
+                    border: 1px solid {DARK_BORDER};
+                    padding: 3px;
+                }}
+                QProgressBar {{
+                    background-color: {DARK_BG};
+                    color: {DARK_FG};
+                    border: 1px solid {DARK_BORDER};
+                    text-align: center;
+                    font-family: Consolas, "Courier New", monospace;
+                }}
+                QProgressBar::chunk {{ background-color: {DARK_PROGRESS_CHUNK}; }}
+                QInputDialog {{ background-color: {DARK_BG}; }}
+                QInputDialog QLabel {{ color: {DARK_FG}; }}
+                QInputDialog QLineEdit {{
+                    background-color: {DARK_BG};
+                    color: {DARK_FG};
+                    border: 1px solid {DARK_BORDER};
+                }}
+                QInputDialog QPushButton {{
+                    background-color: {DARK_BTN_BG};
+                    color: {DARK_FG};
+                    border: 1px solid {DARK_BORDER};
+                    padding: 4px 12px;
+                }}
+                QFileDialog {{ background-color: {DARK_BG}; }}
+                QFileDialog QLabel {{ color: {DARK_FG}; }}
+                QFileDialog QLineEdit {{
+                    background-color: {DARK_BG};
+                    color: {DARK_FG};
+                    border: 1px solid {DARK_BORDER};
+                }}
+                QFileDialog QListView, QFileDialog QTreeView {{
+                    background-color: {DARK_BG};
+                    color: {DARK_FG};
+                }}
+                QFileDialog QPushButton {{
+                    background-color: {DARK_BTN_BG};
+                    color: {DARK_FG};
+                    border: 1px solid {DARK_BORDER};
+                    padding: 4px 12px;
+                }}
             """)
             self.btn_theme.setText("☀️ 日间模式")
         else:
@@ -820,7 +1045,7 @@ class MainWindow(QMainWindow):
                                             out_text = body[4:].decode("gbk", errors="replace")
                                             sess.signals.on_outp.emit(sess, out_text)
                                         elif cmd_code in (b"FDRV", b"FDIR", b"FMET", b"FDAT",
-                                                          b"FDON", b"FACK", b"FOK", b"FERR"):
+                                                          b"FPRO", b"FDON", b"FACK", b"FOK", b"FERR"):
                                             sess.signals.on_fs.emit(sess, body)
                                         else:
                                             log_console(f"收到未知命令: {cmd_code!r}, len={len(body)}")
