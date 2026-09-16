@@ -372,7 +372,6 @@ class RemoteFileDialog(QDialog):
             return
         cmd = payload[:4]
         body = payload[4:]
-        print(f"[VFS RECV] cmd={cmd.decode('ascii','replace')} body_len={len(body)}")
         if cmd == b"LIST":
             self.parse_list_result(body)
         elif cmd == b"READ":
@@ -492,7 +491,6 @@ class RemoteFileDialog(QDialog):
         self.download_remote_fullpath = remote_full
         self.download_offset = 0
         self.download_active = True
-        print(f"[DOWNLOAD] start remote={remote_full.decode('utf‑8','replace')} local={save_path}")
         self.request_next_download_chunk()
 
     def request_next_download_chunk(self):
@@ -508,7 +506,6 @@ class RemoteFileDialog(QDialog):
         offset = struct.unpack_from("<Q", body, 0)[0]
         chunk_data = body[8:]
         if offset != self.download_offset:
-            print(f"[DOWNLOAD] offset mismatch, abort")
             self.download_active = False
             return
         if len(chunk_data) == 0:
@@ -519,7 +516,6 @@ class RemoteFileDialog(QDialog):
             with open(self.dst_download_path,"ab") as f:
                 f.write(chunk_data)
         except Exception as e:
-            print(f"[DOWNLOAD] write file err {e}")
             self.download_active = False
             QMessageBox.critical(self,"下载错误",f"写入本地失败：{str(e)}")
             return
@@ -532,7 +528,6 @@ class RemoteFileDialog(QDialog):
             return
         basename = os.path.basename(local_path)
         remote_full = (self.current_path.decode("utf‑8") + basename).encode("utf‑8")
-        print(f"[UPLOAD] local={local_path} remote={remote_full.decode('utf‑8','replace')}")
         threading.Thread(target=self._upload_worker, args=(local_path, remote_full), daemon=True).start()
 
     def _upload_worker(self, local_path:str, remote_full:bytes):
@@ -548,7 +543,7 @@ class RemoteFileDialog(QDialog):
                     offset += len(chunk)
                     time.sleep(0.02)
         except Exception as e:
-            print(f"[UPLOAD] err {e}")
+            pass
         QTimer.singleShot(200, self.refresh_list)
 
     def closeEvent(self, event):
@@ -697,14 +692,12 @@ class MainWindow(QMainWindow):
         while self.server_running:
             try:
                 raw_conn, addr = self.server_sock.accept()
-                self.log(f"收到TCP连接 {addr}")
                 try:
                     ok_handshake, ip, country, display_name = ws_handle_http_upgrade(raw_conn)
                 except Exception as e:
                     self.log(f"握手解析异常 {addr} , err:{str(e)}")
                     raw_conn.close()
                     continue
-
                 if not ok_handshake:
                     self.log(f"WebSocket握手失败 {addr}")
                     raw_conn.close()
@@ -753,8 +746,8 @@ class MainWindow(QMainWindow):
 
     def client_recv_loop(self, sess: ClientSession):
         buf = sess._recv_buf
-        while sess.connected:
-            try:
+        try:
+            while sess.connected:
                 chunk = sess.conn.recv(4096)
                 if not chunk:
                     break
@@ -802,10 +795,11 @@ class MainWindow(QMainWindow):
                                             sess.signals.on_outp.emit(sess, out_text)
                                         else:
                                             sess.signals.on_vfs_reply.emit(sess, body)
-            except (OSError, ConnectionResetError):
-                break
-        sess.close()
-        sess.signals.on_disconnect.emit(sess)
+        except Exception as e:
+            self.log(f"[会话异常] {sess.display_name} error:{str(e)}")
+        finally:
+            sess.close()
+            sess.signals.on_disconnect.emit(sess)
 
     def start_server(self):
         port = int(self.port_edit.text())
