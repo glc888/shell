@@ -1012,6 +1012,8 @@ class ScreenPreviewDialog(QDialog):
         cmd = body[0:4]
         payload = body[4:]
 
+        self.log(f"on_scr_data: cmd={cmd!r}, body_len={len(body)}, payload_len={len(payload)}")
+
         if cmd == b"SCRM":
             if len(payload) >= 4:
                 self._total = struct.unpack("<I", payload[0:4])[0]
@@ -1037,10 +1039,12 @@ class ScreenPreviewDialog(QDialog):
                     self._finalize()
 
         elif cmd == b"SCRX":
+            self.log(f"SCRX: clen字段={struct.unpack('<I', payload[0:4])[0] if len(payload) >= 4 else 'N/A'}")
             if len(payload) >= 16:
                 clen = struct.unpack("<I", payload[0:4])[0]
                 iv = payload[4:16]
                 cipher = payload[16:16+clen]
+                self.log(f"SCRX: clen={clen}, iv_len={len(iv)}, cipher_len={len(cipher)}")
                 if len(cipher) != clen:
                     self.log(f"SCRX 密文长度不匹配: clen={clen}, got={len(cipher)}")
                     return
@@ -1055,6 +1059,7 @@ class ScreenPreviewDialog(QDialog):
                 try:
                     aesgcm = AESGCM(self.client.shot_key)
                     plain = aesgcm.decrypt(iv, cipher, None)
+                    self.log(f"解密成功: plain_len={len(plain)}")
                 except Exception as e:
                     self.log(f"解密失败: {e}")
                     self.status.setText("解密失败")
@@ -1070,6 +1075,8 @@ class ScreenPreviewDialog(QDialog):
                 self.log(f"完成（SCRX 解密），尺寸={pix.width()}x{pix.height()}，{len(plain)} 字节")
                 self.btn_save.setEnabled(True)
                 self._buf = bytearray(plain)
+            else:
+                self.log(f"SCRX payload 太短: {len(payload)}")
 
     def _finalize(self):
         pix = QPixmap()
@@ -1464,7 +1471,7 @@ class MainWindow(QMainWindow):
         log_console(f"接收线程启动: {sess.display_name}")
         while sess.connected:
             try:
-                chunk = sess.conn.recv(4096)
+                chunk = sess.conn.recv(65536)
                 if not chunk:
                     log_console(f"recv 返回空: {sess.display_name}")
                     break
@@ -1496,11 +1503,14 @@ class MainWindow(QMainWindow):
                             sess.reset_fragment()
                             if len(full_body) >= 4:
                                 body_len = struct.unpack(">I", full_body[0:4])[0]
+                                log_console(f"[WS] 帧完整 len={len(full_body)}, body_len={body_len}")
                                 if len(full_body) >= 4 + body_len:
                                     body = full_body[4:4+body_len]
                                     if len(body) >= 4:
                                         cmd_code = body[0:4]
                                         self._dispatch_packet(sess, cmd_code, body)
+                                else:
+                                    log_console(f"[WS] 帧不完整: 需要 {4+body_len}, 实际 {len(full_body)}")
             except (OSError, ConnectionResetError) as e:
                 log_console(f"recv 异常: {sess.display_name} {e}")
                 break
@@ -1509,6 +1519,7 @@ class MainWindow(QMainWindow):
         sess.signals.on_disconnect.emit(sess)
 
     def _dispatch_packet(self, sess, cmd_code, body):
+        log_console(f"[DISPATCH] {sess.display_name} cmd={cmd_code!r} len={len(body)}")
         if cmd_code == b"PONG":
             sess.last_pong = datetime.now()
             self.client_model.dataChanged.emit(QModelIndex(), QModelIndex())
@@ -1519,6 +1530,7 @@ class MainWindow(QMainWindow):
                           b"FPRO", b"FDON", b"FACK", b"FOK0", b"FERR"):
             sess.signals.on_fs.emit(sess, body)
         elif cmd_code in (b"SCRM", b"SCRD", b"SCRX"):
+            log_console(f"[截屏] 收到 {cmd_code!r}，len={len(body)}")
             sess.signals.on_screen.emit(sess, body)
         elif cmd_code == b"MODE":
             if len(body) >= 5:
