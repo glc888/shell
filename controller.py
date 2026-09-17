@@ -557,10 +557,10 @@ class FileManagerDialog(QDialog):
                         f"[上传完成] {self.format_size(self.upload_total)}")
                     QTimer.singleShot(500, self.on_refresh)
 
-       elif cmd == b"FOK0":
-    log_console("[文件管理] 收到 FOK0")
-    if self.upload_file and self.upload_sent == 0:
-        self.send_next_upload_chunk()
+        elif cmd == b"FOK0":
+            log_console("[文件管理] 收到 FOK0")
+            if self.upload_file and self.upload_sent == 0:
+                self.send_next_upload_chunk()
 
         elif cmd == b"FERR":
             msg = payload.decode("gbk", errors="replace")
@@ -1097,7 +1097,7 @@ class MainWindow(QMainWindow):
                                             out_text = body[4:].decode("gbk", errors="replace")
                                             sess.signals.on_outp.emit(sess, out_text)
                                         elif cmd_code in (b"FDRV", b"FDIR", b"FMET", b"FDAT",
-                  b"FPRO", b"FDON", b"FACK", b"FOK0", b"FERR"):
+                                                          b"FPRO", b"FDON", b"FACK", b"FOK0", b"FERR"):
                                             sess.signals.on_fs.emit(sess, body)
                                         else:
                                             log_console(f"收到未知命令: {cmd_code!r}, len={len(body)}")
