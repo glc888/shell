@@ -557,10 +557,10 @@ class FileManagerDialog(QDialog):
                         f"[上传完成] {self.format_size(self.upload_total)}")
                     QTimer.singleShot(500, self.on_refresh)
 
-        elif cmd == b"FOK":
-            log_console("[文件管理] 收到 FOK")
-            if self.upload_file and self.upload_sent == 0:
-                self.send_next_upload_chunk()
+       elif cmd == b"FOK0":
+    log_console("[文件管理] 收到 FOK0")
+    if self.upload_file and self.upload_sent == 0:
+        self.send_next_upload_chunk()
 
         elif cmd == b"FERR":
             msg = payload.decode("gbk", errors="replace")
