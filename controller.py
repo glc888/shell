@@ -186,6 +186,7 @@ class ClientSignals(QObject):
     on_helper_ack = pyqtSignal(object, bytes)
     on_helper_ready = pyqtSignal(object)
     on_helper_err = pyqtSignal(object, str)
+    on_helper_hok0 = pyqtSignal(object)
 
 
 class ClientSession:
@@ -807,6 +808,15 @@ class ScreenPreviewDialog(QDialog):
         self._last_pixmap = None
         self._waiting_after_upload = False
 
+        # helper 上传状态
+        self._helper_file = None
+        self._helper_total = 0
+        self._helper_sent = 0
+        self._helper_offset = 0
+        self._helper_ack_pending = False
+        self._helper_waiting_hok0_for_start = False
+        self._helper_waiting_hok0_for_done = False
+
         lay = QVBoxLayout(self)
 
         info_bar = QHBoxLayout()
@@ -885,7 +895,6 @@ class ScreenPreviewDialog(QDialog):
             self.setStyleSheet("")
 
     def request_screenshot(self):
-        """点“刷新截图”按钮：只发 SCRN，等 agent 决定是否需要 helper"""
         if self._closing or not self.client.connected:
             return
         self._buf = bytearray()
@@ -897,7 +906,6 @@ class ScreenPreviewDialog(QDialog):
         self.client.send_packet(b"SCRN")
 
     def on_helper_needed(self):
-        """agent 回了 HNED，开始上传 helper"""
         if self._closing:
             return
         if self.client.helper_uploaded:
@@ -922,32 +930,44 @@ class ScreenPreviewDialog(QDialog):
         self._helper_sent = 0
         self._helper_offset = 0
         self._helper_ack_pending = False
+        self._helper_waiting_hok0_for_start = True
+        self._helper_waiting_hok0_for_done = False
         self.upload_label.setText(f"[上传 helper] 0 / {size} 字节")
         self.upload_label.setVisible(True)
         self.upload_bar.setValue(0)
         self.upload_bar.setVisible(True)
         self.log(f"开始上传 helper, 大小={size}")
-        # 发 HUP0
         self.client.send_packet(b"HUP0" + struct.pack("<Q", size))
-        # 等 HOK0 再开始分块
-        self._waiting_hok0 = True
 
-    def on_helper_hok0(self):
-        """agent 收到 HUP0 后回 HOK0，开始发第一块"""
-        self._waiting_hok0 = False
+    def on_helper_hok0_start(self):
+        """收到第一个 HOK0：文件已创建，开始发数据"""
+        self._helper_waiting_hok0_for_start = False
+        self._helper_waiting_hok0_for_done = True
         self._send_next_helper_chunk()
+
+    def on_helper_hok0_done(self):
+        """收到第二个 HOK0：数据写完，上传完成"""
+        self._helper_waiting_hok0_for_done = False
+        self.client.helper_uploading = False
+        self.client.helper_uploaded = True
+        self.upload_bar.setValue(100)
+        self.upload_label.setText("[上传 helper] 完成")
+        self.log("helper 上传完成，发送 HSTR 启动")
+        QTimer.singleShot(300, self._send_hstr)
 
     def _send_next_helper_chunk(self):
         if self._closing or not self.client.connected:
             return
         if self._helper_ack_pending:
             return
+        if not self._helper_file:
+            return
         chunk = self._helper_file.read(HELPER_CHUNK)
         if not chunk:
             self._helper_file.close()
             self._helper_file = None
             self.client.send_packet(b"HDON")
-            self.log("helper 上传完成，等待 HOK0")
+            self.log("helper 数据发完，等待 HOK0")
             return
         offset = self._helper_offset
         body = b"HDAT" + struct.pack("<Q", offset) + chunk
@@ -961,18 +981,8 @@ class ScreenPreviewDialog(QDialog):
             f"[上传 helper] {self._helper_sent} / {self._helper_total} 字节 ({pct}%)")
 
     def on_helper_ack(self, offset: bytes):
-        """agent 每块回 HACK"""
         self._helper_ack_pending = False
         self._send_next_helper_chunk()
-
-    def on_helper_upload_done(self):
-        """agent 回 HOK0：上传完成"""
-        self.client.helper_uploading = False
-        self.client.helper_uploaded = True
-        self.upload_bar.setValue(100)
-        self.upload_label.setText("[上传 helper] 完成")
-        self.log("helper 上传完成，发送 HSTR 启动")
-        QTimer.singleShot(300, self._send_hstr)
 
     def _send_hstr(self):
         if self._closing or not self.client.connected:
@@ -981,7 +991,6 @@ class ScreenPreviewDialog(QDialog):
         self.log("已发送 HSTR，等待 HOK1")
 
     def on_helper_ready(self):
-        """agent 回 HOK1：helper 已就绪"""
         self.log("helper 已就绪，发送 SCRN")
         self.upload_label.setVisible(False)
         self.upload_bar.setVisible(False)
@@ -1028,7 +1037,6 @@ class ScreenPreviewDialog(QDialog):
                     self._finalize()
 
         elif cmd == b"SCRX":
-            # 服务模式：SCRX + 4字节 clen + 12字节 iv + clen字节密文
             if len(payload) >= 16:
                 clen = struct.unpack("<I", payload[0:4])[0]
                 iv = payload[4:16]
@@ -1110,6 +1118,10 @@ class ScreenPreviewDialog(QDialog):
 
     def closeEvent(self, event):
         self._closing = True
+        if self._helper_file:
+            try: self._helper_file.close()
+            except Exception: pass
+            self._helper_file = None
         if self.main_window and self.client in self.main_window.open_screen_dialogs:
             if self.main_window.open_screen_dialogs[self.client] is self:
                 del self.main_window.open_screen_dialogs[self.client]
@@ -1519,7 +1531,7 @@ class MainWindow(QMainWindow):
                 sess.shot_key = body[4:36]
                 sess.signals.on_skey.emit(sess)
                 log_console(f"[SKEY] {sess.display_name} 密钥已保存")
-        elif cmd_code == b"HNED":     # ← 改这里：HNEED → HNED
+        elif cmd_code == b"HNED":
             log_console(f"[HNED] {sess.display_name} 需要 helper")
             sess.signals.on_helper_needed.emit(sess)
         elif cmd_code == b"HACK":
@@ -1527,10 +1539,16 @@ class MainWindow(QMainWindow):
                 offset = body[4:12]
                 sess.signals.on_helper_ack.emit(sess, offset)
         elif cmd_code == b"HOK0":
-            log_console(f"[HOK0] {sess.display_name} helper 上传完成")
             dlg = self.open_screen_dialogs.get(sess)
             if dlg is not None:
-                dlg.on_helper_upload_done()
+                if dlg._helper_waiting_hok0_for_start:
+                    log_console(f"[HOK0] {sess.display_name} 文件已创建，开始发数据")
+                    dlg.on_helper_hok0_start()
+                elif dlg._helper_waiting_hok0_for_done:
+                    log_console(f"[HOK0] {sess.display_name} 上传完成")
+                    dlg.on_helper_hok0_done()
+                else:
+                    log_console(f"[HOK0] {sess.display_name} 状态异常，忽略")
         elif cmd_code == b"HOK1":
             log_console(f"[HOK1] {sess.display_name} helper 就绪")
             sess.signals.on_helper_ready.emit(sess)
