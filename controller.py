@@ -1097,7 +1097,7 @@ class MainWindow(QMainWindow):
                                             out_text = body[4:].decode("gbk", errors="replace")
                                             sess.signals.on_outp.emit(sess, out_text)
                                         elif cmd_code in (b"FDRV", b"FDIR", b"FMET", b"FDAT",
-                                                          b"FPRO", b"FDON", b"FACK", b"FOK", b"FERR"):
+                  b"FPRO", b"FDON", b"FACK", b"FOK0", b"FERR"):
                                             sess.signals.on_fs.emit(sess, body)
                                         else:
                                             log_console(f"收到未知命令: {cmd_code!r}, len={len(body)}")
