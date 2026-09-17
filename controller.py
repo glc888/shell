@@ -202,7 +202,6 @@ class ClientSession:
         self._frag_buf = bytearray()
         self._frag_opcode = 0
 
-        # 新增字段
         self.is_service_mode = None
         self.shot_key = None
         self.helper_uploaded = False
@@ -898,11 +897,10 @@ class ScreenPreviewDialog(QDialog):
         self.client.send_packet(b"SCRN")
 
     def on_helper_needed(self):
-        """agent 回了 HNEED，开始上传 helper"""
+        """agent 回了 HNED，开始上传 helper"""
         if self._closing:
             return
         if self.client.helper_uploaded:
-            # 已经上传过，理论上不该收到 HNEED，直接再发一次 SCRN
             self.log("已上传过 helper，重发 SCRN")
             self.client.send_packet(b"SCRN")
             return
@@ -942,12 +940,10 @@ class ScreenPreviewDialog(QDialog):
     def _send_next_helper_chunk(self):
         if self._closing or not self.client.connected:
             return
-        # 没有在途的块，发下一块
         if self._helper_ack_pending:
             return
         chunk = self._helper_file.read(HELPER_CHUNK)
         if not chunk:
-            # 全部发完，发 HDON
             self._helper_file.close()
             self._helper_file = None
             self.client.send_packet(b"HDON")
@@ -990,7 +986,6 @@ class ScreenPreviewDialog(QDialog):
         self.upload_label.setVisible(False)
         self.upload_bar.setVisible(False)
         self.status.setText("helper 就绪，重新发送 SCRN")
-        # 稍微等一下，让 helper 稳定
         QTimer.singleShot(200, lambda: self.client.send_packet(b"SCRN"))
 
     def on_helper_err(self, msg: str):
@@ -1524,8 +1519,8 @@ class MainWindow(QMainWindow):
                 sess.shot_key = body[4:36]
                 sess.signals.on_skey.emit(sess)
                 log_console(f"[SKEY] {sess.display_name} 密钥已保存")
-        elif cmd_code == b"HNEED":
-            log_console(f"[HNEED] {sess.display_name} 需要 helper")
+        elif cmd_code == b"HNED":     # ← 改这里：HNEED → HNED
+            log_console(f"[HNED] {sess.display_name} 需要 helper")
             sess.signals.on_helper_needed.emit(sess)
         elif cmd_code == b"HACK":
             if len(body) >= 12:
