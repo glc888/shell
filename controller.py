@@ -791,7 +791,7 @@ class FileManagerDialog(QDialog):
 
 
 class ScreenPreviewDialog(QDialog):
-    """接收 agent 的 SCRM/SCRD（桌面模式明文）或 SCRX（服务模式密文）"""
+    """接收 agent 的 SCRM/SCRV/SCRD（加密分块）"""
 
     def __init__(self, client_session: ClientSession, parent=None):
         super().__init__(parent)
@@ -805,6 +805,7 @@ class ScreenPreviewDialog(QDialog):
         self._total = 0
         self._chunks_received = 0
         self._chunks_total = 0
+        self._iv = None
         self._last_pixmap = None
         self._waiting_after_upload = False
 
@@ -901,6 +902,7 @@ class ScreenPreviewDialog(QDialog):
         self._total = 0
         self._chunks_received = 0
         self._chunks_total = 0
+        self._iv = None
         self.status.setText("已发送 SCRN，等待数据...")
         self.log("已发送 SCRN")
         self.client.send_packet(b"SCRN")
@@ -940,13 +942,11 @@ class ScreenPreviewDialog(QDialog):
         self.client.send_packet(b"HUP0" + struct.pack("<Q", size))
 
     def on_helper_hok0_start(self):
-        """收到第一个 HOK0：文件已创建，开始发数据"""
         self._helper_waiting_hok0_for_start = False
         self._helper_waiting_hok0_for_done = True
         self._send_next_helper_chunk()
 
     def on_helper_hok0_done(self):
-        """收到第二个 HOK0：数据写完，上传完成"""
         self._helper_waiting_hok0_for_done = False
         self.client.helper_uploading = False
         self.client.helper_uploaded = True
@@ -1020,8 +1020,14 @@ class ScreenPreviewDialog(QDialog):
                 self._buf = bytearray()
                 self._chunks_received = 0
                 self._chunks_total = 0
+                self._iv = None
                 self.status.setText(f"开始接收，总大小 {self._total} 字节")
                 self.log(f"SCRM: total={self._total}")
+
+        elif cmd == b"SCRV":
+            if len(payload) >= 12:
+                self._iv = payload[0:12]
+                self.log(f"SCRV: iv 已接收")
 
         elif cmd == b"SCRD":
             if len(payload) >= 8:
@@ -1035,48 +1041,73 @@ class ScreenPreviewDialog(QDialog):
                 self.status.setText(
                     f"接收中 {self._chunks_received}/{self._chunks_total} 块，"
                     f"累计 {len(self._buf)}/{self._total} 字节")
+                self.log(f"SCRD: {self._chunks_received}/{self._chunks_total}, buf={len(self._buf)}")
                 if self._total > 0 and len(self._buf) >= self._total:
-                    self._finalize()
+                    self._finalize_scrx()
 
+        # 老的 SCRX（如果 agent 还发的话，兼容）
         elif cmd == b"SCRX":
-            self.log(f"SCRX: clen字段={struct.unpack('<I', payload[0:4])[0] if len(payload) >= 4 else 'N/A'}")
+            self.log(f"SCRX（老格式）")
             if len(payload) >= 16:
                 clen = struct.unpack("<I", payload[0:4])[0]
                 iv = payload[4:16]
                 cipher = payload[16:16+clen]
-                self.log(f"SCRX: clen={clen}, iv_len={len(iv)}, cipher_len={len(cipher)}")
                 if len(cipher) != clen:
-                    self.log(f"SCRX 密文长度不匹配: clen={clen}, got={len(cipher)}")
+                    self.log(f"SCRX 长度不匹配")
                     return
-                if not self.client.shot_key:
-                    self.log("没有 shot key，无法解密")
-                    self.status.setText("缺少解密密钥")
-                    return
-                if not HAS_AESGCM:
-                    self.log("cryptography 库未安装，无法解密")
-                    self.status.setText("缺少 cryptography 库")
+                if not self.client.shot_key or not HAS_AESGCM:
+                    self.log("缺少解密条件")
                     return
                 try:
                     aesgcm = AESGCM(self.client.shot_key)
                     plain = aesgcm.decrypt(iv, cipher, None)
-                    self.log(f"解密成功: plain_len={len(plain)}")
                 except Exception as e:
                     self.log(f"解密失败: {e}")
-                    self.status.setText("解密失败")
                     return
                 pix = QPixmap()
                 if not pix.loadFromData(plain, "JPEG"):
                     self.log("JPEG 解码失败")
-                    self.status.setText("解码失败")
                     return
                 self._last_pixmap = pix
                 self._display_pixmap()
-                self.status.setText(f"完成 {pix.width()}x{pix.height()}，{len(plain)} 字节")
-                self.log(f"完成（SCRX 解密），尺寸={pix.width()}x{pix.height()}，{len(plain)} 字节")
+                self.status.setText(f"完成 {pix.width()}x{pix.height()}")
+                self.log(f"完成（SCRX 老格式）")
                 self.btn_save.setEnabled(True)
                 self._buf = bytearray(plain)
-            else:
-                self.log(f"SCRX payload 太短: {len(payload)}")
+
+    def _finalize_scrx(self):
+        """SCRD 收满后，用 shot_key 解密并显示"""
+        if not self.client.shot_key:
+            self.log("没有 shot key，无法解密")
+            self.status.setText("缺少解密密钥")
+            return
+        if not HAS_AESGCM:
+            self.log("cryptography 库未安装，无法解密")
+            self.status.setText("缺少 cryptography 库")
+            return
+        if not self._iv:
+            self.log("没有 iv，无法解密")
+            self.status.setText("缺少 iv")
+            return
+        try:
+            aesgcm = AESGCM(self.client.shot_key)
+            plain = aesgcm.decrypt(self._iv, bytes(self._buf), None)
+            self.log(f"解密成功: plain_len={len(plain)}")
+        except Exception as e:
+            self.log(f"解密失败: {e}")
+            self.status.setText("解密失败")
+            return
+        pix = QPixmap()
+        if not pix.loadFromData(plain, "JPEG"):
+            self.log("JPEG 解码失败")
+            self.status.setText("解码失败")
+            return
+        self._last_pixmap = pix
+        self._display_pixmap()
+        self.status.setText(f"完成 {pix.width()}x{pix.height()}，{len(plain)} 字节")
+        self.log(f"完成（分块解密），尺寸={pix.width()}x{pix.height()}，{len(plain)} 字节")
+        self.btn_save.setEnabled(True)
+        self._buf = bytearray(plain)
 
     def _finalize(self):
         pix = QPixmap()
@@ -1503,7 +1534,6 @@ class MainWindow(QMainWindow):
                             sess.reset_fragment()
                             if len(full_body) >= 4:
                                 body_len = struct.unpack(">I", full_body[0:4])[0]
-                                log_console(f"[WS] 帧完整 len={len(full_body)}, body_len={body_len}")
                                 if len(full_body) >= 4 + body_len:
                                     body = full_body[4:4+body_len]
                                     if len(body) >= 4:
@@ -1519,7 +1549,6 @@ class MainWindow(QMainWindow):
         sess.signals.on_disconnect.emit(sess)
 
     def _dispatch_packet(self, sess, cmd_code, body):
-        log_console(f"[DISPATCH] {sess.display_name} cmd={cmd_code!r} len={len(body)}")
         if cmd_code == b"PONG":
             sess.last_pong = datetime.now()
             self.client_model.dataChanged.emit(QModelIndex(), QModelIndex())
@@ -1529,8 +1558,7 @@ class MainWindow(QMainWindow):
         elif cmd_code in (b"FDRV", b"FDIR", b"FMET", b"FDAT",
                           b"FPRO", b"FDON", b"FACK", b"FOK0", b"FERR"):
             sess.signals.on_fs.emit(sess, body)
-        elif cmd_code in (b"SCRM", b"SCRD", b"SCRX"):
-            log_console(f"[截屏] 收到 {cmd_code!r}，len={len(body)}")
+        elif cmd_code in (b"SCRM", b"SCRV", b"SCRD", b"SCRX"):
             sess.signals.on_screen.emit(sess, body)
         elif cmd_code == b"MODE":
             if len(body) >= 5:
