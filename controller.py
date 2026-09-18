@@ -49,13 +49,12 @@ def log_console(msg: str):
 
 
 def hexdump_short(data: bytes, maxlen: int = 16) -> str:
-    """短字节预览，用于日志"""
     if data is None:
         return "None"
     n = min(len(data), maxlen)
     s = data[:n].hex()
     if len(data) > n:
-        s += f"...(总 {len(data)} 字节)"
+        s += f"...(total {len(data)} bytes)"
     return s
 
 
@@ -813,8 +812,9 @@ class FileManagerDialog(QDialog):
 class ScreenPreviewDialog(QDialog):
     """桌面/服务两种模式共用同一套 UI 和执行流程。
     默认：点刷新 -> 发 SCRS(key) -> agent 回 SCRM/SCRV/SCRD 或 HNED
-    收到 HNED -> 上传 helper -> HOK1 后就绪 -> 自动重发 SCRS
-    勾选强制上传：点刷新 -> 直接上传 helper -> HOK1 后就绪 -> 自动发 SCRS
+    收到 HNED -> 上传 helper -> HOK1 后就绪 -> 自动补发 SCRS
+    勾选强制上传：点刷新 -> 直接上传 helper -> HOK1 后就绪 -> 自动补发 SCRS
+    关闭窗口：发 SCRE 通知 agent 清理 helper 和共享内存
     """
 
     def __init__(self, client_session: ClientSession, parent=None):
@@ -968,6 +968,12 @@ class ScreenPreviewDialog(QDialog):
             self._start_upload_helper()
             return
 
+        self._send_scrs()
+
+    def _send_scrs(self):
+        """只发 SCRS，不检查强制上传复选框。用于普通刷新和 helper 就绪后补发。"""
+        if self._closing or not self.client.connected:
+            return
         self.client.shot_key = os.urandom(32)
         self.log(f"生成新 key: {hexdump_short(self.client.shot_key)}")
         self.client.send_packet(b"SCRS" + self.client.shot_key)
@@ -1087,8 +1093,8 @@ class ScreenPreviewDialog(QDialog):
         self.upload_bar.setVisible(False)
         if self._pending_scrs_after_helper:
             self._pending_scrs_after_helper = False
-            log_console("[截屏] 补发刷新")
-            QTimer.singleShot(200, self.request_screenshot)
+            log_console("[截屏] 补发 SCRS（跳过强制上传检查）")
+            QTimer.singleShot(200, self._send_scrs)
         else:
             self.recv_label.setText("helper 就绪，可点击刷新截图")
 
@@ -1265,6 +1271,14 @@ class ScreenPreviewDialog(QDialog):
             try: self._helper_file.close()
             except Exception: pass
             self._helper_file = None
+
+        # 通知 agent 终止 helper、释放共享内存
+        if self.client.connected:
+            log_console(f"[截屏] 关闭窗口，发送 SCRE 通知 agent 清理 helper")
+            self.client.send_packet(b"SCRE")
+        else:
+            log_console("[截屏] 关闭窗口，连接已断开，无法通知 agent")
+
         if self.main_window and self.client in self.main_window.open_screen_dialogs:
             if self.main_window.open_screen_dialogs[self.client] is self:
                 del self.main_window.open_screen_dialogs[self.client]
