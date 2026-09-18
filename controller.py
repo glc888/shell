@@ -811,10 +811,13 @@ class FileManagerDialog(QDialog):
 
 class ScreenPreviewDialog(QDialog):
     """桌面/服务两种模式共用同一套 UI 和执行流程。
-    默认：点刷新 -> 发 SCRS(key) -> agent 回 SCRM/SCRV/SCRD 或 HNED
-    收到 HNED -> 上传 helper -> HOK1 后就绪 -> 自动补发 SCRS
-    勾选强制上传：点刷新 -> 直接上传 helper -> HOK1 后就绪 -> 自动补发 SCRS
-    关闭窗口：发 SCRE 通知 agent 清理 helper 和共享内存
+
+    新协议（agent 修复后）：
+      SCRM: [SCRM][4B total][12B IV]  —— 一次发完 meta + IV
+      SCRD: [SCRD][4B idx][4B chunks][payload]  —— 主机字节序
+    兼容旧协议：
+      SCRM: [SCRM][4B total]
+      SCRV: [SCRV][12B IV]
     """
 
     def __init__(self, client_session: ClientSession, parent=None):
@@ -971,7 +974,7 @@ class ScreenPreviewDialog(QDialog):
         self._send_scrs()
 
     def _send_scrs(self):
-        """只发 SCRS，不检查强制上传复选框。用于普通刷新和 helper 就绪后补发。"""
+        """只发 SCRS，不检查强制上传复选框。"""
         if self._closing or not self.client.connected:
             return
         self.client.shot_key = os.urandom(32)
@@ -1116,7 +1119,20 @@ class ScreenPreviewDialog(QDialog):
         payload = body[4:]
 
         if cmd == b"SCRM":
-            if len(payload) >= 4:
+            # 新格式：[4B total][12B IV]
+            # 旧格式：[4B total]（后面单独来 SCRV）
+            if len(payload) >= 16:
+                self._total = struct.unpack("<I", payload[0:4])[0]
+                self._iv = payload[4:16]
+                self._chunks_total = 0
+                self._chunks = {}
+                self.recv_bar.setValue(0)
+                self.recv_bar.setVisible(True)
+                self.recv_label.setVisible(True)
+                self.recv_label.setText(f"开始接收，总大小 {self._total} 字节")
+                log_console(f"[截屏] SCRM(新) total={self._total} "
+                            f"iv={hexdump_short(self._iv)}")
+            elif len(payload) >= 4:
                 self._total = struct.unpack("<I", payload[0:4])[0]
                 self._iv = None
                 self._chunks_total = 0
@@ -1125,17 +1141,21 @@ class ScreenPreviewDialog(QDialog):
                 self.recv_bar.setVisible(True)
                 self.recv_label.setVisible(True)
                 self.recv_label.setText(f"开始接收，总大小 {self._total} 字节")
-                log_console(f"[截屏] SCRM total={self._total}")
+                log_console(f"[截屏] SCRM(旧) total={self._total}，等 SCRV")
             else:
                 log_console("[截屏] SCRM 载荷不足")
+
         elif cmd == b"SCRV":
+            # 兼容旧 agent
             if len(payload) >= 12:
                 self._iv = payload[0:12]
                 log_console(f"[截屏] SCRV iv={hexdump_short(self._iv)}")
             else:
                 log_console("[截屏] SCRV 载荷不足")
+
         elif cmd == b"SCRD":
             if len(payload) >= 8:
+                # 主机字节序（小端），与 agent 修复后一致
                 idx = struct.unpack("<I", payload[0:4])[0]
                 total_chunks = struct.unpack("<I", payload[4:8])[0]
                 data = payload[8:]
@@ -1157,7 +1177,9 @@ class ScreenPreviewDialog(QDialog):
                     self._finalize_scrx()
             else:
                 log_console("[截屏] SCRD 载荷不足")
+
         elif cmd == b"SCRX":
+            # 老格式兼容
             log_console(f"[截屏] 收到老格式 SCRX len={len(payload)}")
             if len(payload) >= 16:
                 clen = struct.unpack("<I", payload[0:4])[0]
@@ -1272,7 +1294,6 @@ class ScreenPreviewDialog(QDialog):
             except Exception: pass
             self._helper_file = None
 
-        # 通知 agent 终止 helper、释放共享内存
         if self.client.connected:
             log_console(f"[截屏] 关闭窗口，发送 SCRE 通知 agent 清理 helper")
             self.client.send_packet(b"SCRE")
