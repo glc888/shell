@@ -42,6 +42,13 @@ DARK_BTN_HOVER = "#003300"
 DARK_DISABLED = "#005500"
 DARK_PROGRESS_CHUNK = "#00aa00"
 
+LIGHT_BG = "#ffffff"
+LIGHT_SEL_BG = "#cce8cc"
+LIGHT_BORDER = "#888888"
+LIGHT_BTN_BG = "#f0f0f0"
+LIGHT_BTN_HOVER = "#e0e0e0"
+LIGHT_PROGRESS_CHUNK = "#00aa00"
+
 
 def log_console(msg: str):
     ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -306,7 +313,22 @@ class RemoteCmdDialog(QDialog):
                 }}
             """)
         else:
-            self.setStyleSheet("")
+            self.setStyleSheet(f"""
+                QDialog {{ background-color: {LIGHT_BG}; }}
+                QLabel {{ color: {fg_color}; }}
+                QTextEdit {{
+                    background-color: {LIGHT_BG};
+                    color: {fg_color};
+                    border: 1px solid {LIGHT_BORDER};
+                    font-family: Consolas, "Courier New", monospace;
+                }}
+                QLineEdit {{
+                    background-color: {LIGHT_BG};
+                    color: {fg_color};
+                    border: 1px solid {LIGHT_BORDER};
+                    font-family: Consolas, "Courier New", monospace;
+                }}
+            """)
 
     @pyqtSlot(str)
     def append_text(self, text: str):
@@ -362,6 +384,7 @@ class FileManagerDialog(QDialog):
         self.upload_inflight = 0
         self.upload_path = ""
         self.fs_events = []
+        self.pending_op = None   # ("del"/"ren"/"mkd", detail)
 
         lay = QVBoxLayout(self)
         path_lay = QHBoxLayout()
@@ -460,7 +483,54 @@ class FileManagerDialog(QDialog):
                 QProgressBar::chunk {{ background-color: {DARK_PROGRESS_CHUNK}; }}
             """)
         else:
-            self.setStyleSheet("")
+            self.setStyleSheet(f"""
+                QDialog {{ background-color: {LIGHT_BG}; }}
+                QLabel {{ color: {fg_color}; }}
+                QLineEdit {{
+                    background-color: {LIGHT_BG};
+                    color: {fg_color};
+                    border: 1px solid {LIGHT_BORDER};
+                    font-family: Consolas, "Courier New", monospace;
+                }}
+                QTreeWidget {{
+                    background-color: {LIGHT_BG};
+                    color: {fg_color};
+                    border: 1px solid {LIGHT_BORDER};
+                    font-family: Consolas, "Courier New", monospace;
+                }}
+                QTreeWidget::item:selected {{
+                    background-color: {LIGHT_SEL_BG};
+                    color: {fg_color};
+                }}
+                QTreeWidget QHeaderView::section {{
+                    background-color: {LIGHT_BTN_BG};
+                    color: {fg_color};
+                    border: 1px solid {LIGHT_BORDER};
+                    padding: 3px;
+                }}
+                QTextEdit {{
+                    background-color: {LIGHT_BG};
+                    color: {fg_color};
+                    border: 1px solid {LIGHT_BORDER};
+                    font-family: Consolas, "Courier New", monospace;
+                }}
+                QPushButton {{
+                    background-color: {LIGHT_BTN_BG};
+                    color: {fg_color};
+                    border: 1px solid {LIGHT_BORDER};
+                    padding: 4px 10px;
+                    font-family: Consolas, "Courier New", monospace;
+                }}
+                QPushButton:hover {{ background-color: {LIGHT_BTN_HOVER}; }}
+                QProgressBar {{
+                    background-color: {LIGHT_BG};
+                    color: {fg_color};
+                    border: 1px solid {LIGHT_BORDER};
+                    text-align: center;
+                    font-family: Consolas, "Courier New", monospace;
+                }}
+                QProgressBar::chunk {{ background-color: {LIGHT_PROGRESS_CHUNK}; }}
+            """)
 
     def log(self, msg):
         self.log_box.append(msg)
@@ -598,11 +668,25 @@ class FileManagerDialog(QDialog):
             log_console("[文件管理] FOK0")
             if self.upload_file and self.upload_sent == 0:
                 self.send_next_upload_chunk()
+            elif self.pending_op:
+                op, detail = self.pending_op
+                self.pending_op = None
+                if op == "del":
+                    self.log(f"[删除成功] {detail}")
+                elif op == "ren":
+                    self.log(f"[重命名成功] {detail}")
+                elif op == "mkd":
+                    self.log(f"[新建目录成功] {detail}")
+                QTimer.singleShot(500, self.on_refresh)
 
         elif cmd == b"FERR":
             msg = payload.decode("gbk", errors="replace")
             log_console(f"[文件管理] FERR: {msg}")
             self.log(f"[错误] {msg}")
+            QMessageBox.warning(self, "操作失败", msg)
+            if self.pending_op:
+                self.pending_op = None
+            QTimer.singleShot(500, self.on_refresh)
 
     def finish_download(self):
         if not self.download_buf:
@@ -696,8 +780,8 @@ class FileManagerDialog(QDialog):
         menu = QMenu()
         act_download = menu.addAction("下载") if typ == "文件" else None
         act_upload = menu.addAction("上传到此目录") if typ in ("目录", "驱动器") else None
-        act_delete = menu.addAction("删除")
-        act_rename = menu.addAction("重命名")
+        act_delete = menu.addAction("删除") if typ == "文件" else None
+        act_rename = menu.addAction("重命名") if typ == "文件" else None
         act_mkdir = menu.addAction("新建文件夹") if typ in ("目录", "驱动器") else None
         ret = menu.exec(self.tree.viewport().mapToGlobal(pos))
         if act_download and ret == act_download:
@@ -705,26 +789,26 @@ class FileManagerDialog(QDialog):
             self.client.send_packet(b"FGET" + full.encode("gbk", errors="replace"))
         elif act_upload and ret == act_upload:
             self.start_upload_to(full)
-        elif ret == act_delete:
+        elif act_delete and ret == act_delete:
             log_console(f"[文件管理] 删除 {full}")
+            self.pending_op = ("del", full)
             self.client.send_packet(b"FDEL" + full.encode("gbk", errors="replace"))
-            QTimer.singleShot(500, self.on_refresh)
-        elif ret == act_rename:
+        elif act_rename and ret == act_rename:
             new_name, ok = QInputDialog.getText(self, "重命名", "新名称:", text=item.text(0))
             if ok and new_name:
                 parent = full.rsplit("\\", 1)[0]
                 new_full = parent + "\\" + new_name
                 payload = f"{full}|{new_full}"
                 log_console(f"[文件管理] 重命名 {full} -> {new_full}")
+                self.pending_op = ("ren", f"{full} -> {new_full}")
                 self.client.send_packet(b"FREN" + payload.encode("gbk", errors="replace"))
-                QTimer.singleShot(500, self.on_refresh)
         elif act_mkdir and ret == act_mkdir:
             name, ok = QInputDialog.getText(self, "新建文件夹", "名称:")
             if ok and name:
                 new_dir = full.rstrip("\\") + "\\" + name
                 log_console(f"[文件管理] 新建目录 {new_dir}")
+                self.pending_op = ("mkd", new_dir)
                 self.client.send_packet(b"FMKD" + new_dir.encode("gbk", errors="replace"))
-                QTimer.singleShot(500, self.on_refresh)
 
     def start_upload_to(self, remote_dir):
         local_path, _ = QFileDialog.getOpenFileName(self, "选择要上传的文件")
@@ -790,6 +874,7 @@ class FileManagerDialog(QDialog):
         self.upload_acked = 0
         self.upload_inflight = 0
         self.upload_path = ""
+        self.pending_op = None
         self.progress_bar.setValue(0)
         self.progress_label.setText("")
 
@@ -810,16 +895,6 @@ class FileManagerDialog(QDialog):
 
 
 class ScreenPreviewDialog(QDialog):
-    """桌面/服务两种模式共用同一套 UI 和执行流程。
-
-    新协议（agent 修复后）：
-      SCRM: [SCRM][4B total][12B IV]  —— 一次发完 meta + IV
-      SCRD: [SCRD][4B idx][4B chunks][payload]  —— 主机字节序
-    兼容旧协议：
-      SCRM: [SCRM][4B total]
-      SCRV: [SCRV][12B IV]
-    """
-
     def __init__(self, client_session: ClientSession, parent=None):
         super().__init__(parent)
         self.main_window = parent
@@ -947,9 +1022,34 @@ class ScreenPreviewDialog(QDialog):
                 QProgressBar::chunk {{ background-color: {DARK_PROGRESS_CHUNK}; }}
             """)
         else:
-            self.setStyleSheet("")
+            self.setStyleSheet(f"""
+                QDialog {{ background-color: {LIGHT_BG}; }}
+                QLabel {{ color: {fg_color}; }}
+                QCheckBox {{ color: {fg_color}; }}
+                QTextEdit {{
+                    background-color: {LIGHT_BG};
+                    color: {fg_color};
+                    border: 1px solid {LIGHT_BORDER};
+                    font-family: Consolas, "Courier New", monospace;
+                }}
+                QPushButton {{
+                    background-color: {LIGHT_BTN_BG};
+                    color: {fg_color};
+                    border: 1px solid {LIGHT_BORDER};
+                    padding: 4px 10px;
+                    font-family: Consolas, "Courier New", monospace;
+                }}
+                QPushButton:hover {{ background-color: {LIGHT_BTN_HOVER}; }}
+                QProgressBar {{
+                    background-color: {LIGHT_BG};
+                    color: {fg_color};
+                    border: 1px solid {LIGHT_BORDER};
+                    text-align: center;
+                    font-family: Consolas, "Courier New", monospace;
+                }}
+                QProgressBar::chunk {{ background-color: {LIGHT_PROGRESS_CHUNK}; }}
+            """)
 
-    # ---------- 刷新入口 ----------
     def request_screenshot(self):
         log_console(f"[截屏] {self.client.display_name} 收到刷新请求")
         if self._closing:
@@ -974,7 +1074,6 @@ class ScreenPreviewDialog(QDialog):
         self._send_scrs()
 
     def _send_scrs(self):
-        """只发 SCRS，不检查强制上传复选框。"""
         if self._closing or not self.client.connected:
             return
         self.client.shot_key = os.urandom(32)
@@ -995,7 +1094,6 @@ class ScreenPreviewDialog(QDialog):
         self.recv_bar.setVisible(False)
         self.recv_label.setVisible(False)
 
-    # ---------- helper 上传 ----------
     def on_helper_needed(self):
         log_console(f"[截屏] {self.client.display_name} 收到 HNED，需要 helper")
         if self._closing:
@@ -1108,7 +1206,6 @@ class ScreenPreviewDialog(QDialog):
         self.upload_bar.setVisible(False)
         self._pending_scrs_after_helper = False
 
-    # ---------- 接收截图 ----------
     def on_scr_data(self, sess, body: bytes):
         if self._closing:
             return
@@ -1119,8 +1216,6 @@ class ScreenPreviewDialog(QDialog):
         payload = body[4:]
 
         if cmd == b"SCRM":
-            # 新格式：[4B total][12B IV]
-            # 旧格式：[4B total]（后面单独来 SCRV）
             if len(payload) >= 16:
                 self._total = struct.unpack("<I", payload[0:4])[0]
                 self._iv = payload[4:16]
@@ -1146,7 +1241,6 @@ class ScreenPreviewDialog(QDialog):
                 log_console("[截屏] SCRM 载荷不足")
 
         elif cmd == b"SCRV":
-            # 兼容旧 agent
             if len(payload) >= 12:
                 self._iv = payload[0:12]
                 log_console(f"[截屏] SCRV iv={hexdump_short(self._iv)}")
@@ -1155,7 +1249,6 @@ class ScreenPreviewDialog(QDialog):
 
         elif cmd == b"SCRD":
             if len(payload) >= 8:
-                # 主机字节序（小端），与 agent 修复后一致
                 idx = struct.unpack("<I", payload[0:4])[0]
                 total_chunks = struct.unpack("<I", payload[4:8])[0]
                 data = payload[8:]
@@ -1179,7 +1272,6 @@ class ScreenPreviewDialog(QDialog):
                 log_console("[截屏] SCRD 载荷不足")
 
         elif cmd == b"SCRX":
-            # 老格式兼容
             log_console(f"[截屏] 收到老格式 SCRX len={len(payload)}")
             if len(payload) >= 16:
                 clen = struct.unpack("<I", payload[0:4])[0]
@@ -1293,12 +1385,6 @@ class ScreenPreviewDialog(QDialog):
             try: self._helper_file.close()
             except Exception: pass
             self._helper_file = None
-
-        if self.client.connected:
-            log_console(f"[截屏] 关闭窗口，发送 SCRE 通知 agent 清理 helper")
-            self.client.send_packet(b"SCRE")
-        else:
-            log_console("[截屏] 关闭窗口，连接已断开，无法通知 agent")
 
         if self.main_window and self.client in self.main_window.open_screen_dialogs:
             if self.main_window.open_screen_dialogs[self.client] is self:
@@ -1508,7 +1594,77 @@ class MainWindow(QMainWindow):
             """)
             self.btn_theme.setText("☀️ 日间模式")
         else:
-            self.setStyleSheet("")
+            self.setStyleSheet(f"""
+                QMainWindow {{ background-color: {LIGHT_BG}; }}
+                QWidget {{ background-color: {LIGHT_BG}; color: {fg}; }}
+                QLabel {{ color: {fg}; }}
+                QCheckBox {{ color: {fg}; }}
+                QLineEdit {{
+                    background-color: {LIGHT_BG};
+                    color: {fg};
+                    border: 1px solid {LIGHT_BORDER};
+                    padding: 4px;
+                    font-family: Consolas, "Courier New", monospace;
+                }}
+                QPushButton {{
+                    background-color: {LIGHT_BTN_BG};
+                    color: {fg};
+                    border: 1px solid {LIGHT_BORDER};
+                    padding: 5px 15px;
+                    font-family: Consolas, "Courier New", monospace;
+                }}
+                QPushButton:hover {{ background-color: {LIGHT_BTN_HOVER}; }}
+                QListView {{
+                    background-color: {LIGHT_BG};
+                    color: {fg};
+                    border: 1px solid {LIGHT_BORDER};
+                    font-family: Consolas, "Courier New", monospace;
+                }}
+                QListView::item:selected {{
+                    background-color: {LIGHT_SEL_BG};
+                    color: {fg};
+                }}
+                QTextEdit {{
+                    background-color: {LIGHT_BG};
+                    color: {fg};
+                    border: 1px solid {LIGHT_BORDER};
+                    font-family: Consolas, "Courier New", monospace;
+                }}
+                QMenu {{
+                    background-color: {LIGHT_BG};
+                    color: {fg};
+                    border: 1px solid {LIGHT_BORDER};
+                    font-family: Consolas, "Courier New", monospace;
+                }}
+                QMenu::item:selected {{
+                    background-color: {LIGHT_SEL_BG};
+                    color: {fg};
+                }}
+                QTreeWidget {{
+                    background-color: {LIGHT_BG};
+                    color: {fg};
+                    border: 1px solid {LIGHT_BORDER};
+                    font-family: Consolas, "Courier New", monospace;
+                }}
+                QTreeWidget::item:selected {{
+                    background-color: {LIGHT_SEL_BG};
+                    color: {fg};
+                }}
+                QTreeWidget QHeaderView::section {{
+                    background-color: {LIGHT_BTN_BG};
+                    color: {fg};
+                    border: 1px solid {LIGHT_BORDER};
+                    padding: 3px;
+                }}
+                QProgressBar {{
+                    background-color: {LIGHT_BG};
+                    color: {fg};
+                    border: 1px solid {LIGHT_BORDER};
+                    text-align: center;
+                    font-family: Consolas, "Courier New", monospace;
+                }}
+                QProgressBar::chunk {{ background-color: {LIGHT_PROGRESS_CHUNK}; }}
+            """)
             self.btn_theme.setText("🌙 夜间模式")
         for dlg in self.open_cmd_dialogs.values():
             dlg.apply_theme(dark, fg)
